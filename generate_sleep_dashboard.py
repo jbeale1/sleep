@@ -1,0 +1,1268 @@
+#!/usr/bin/env python3
+"""
+Generate Sleep Dashboard HTML - 2026-02-05 J.Beale
+
+Reads four CSV files from a directory and produces an interactive HTML
+dashboard with synchronized panels for SpO2, Heart Rate, Respiratory Rate,
+Apnea/Obstruction events, and Motion.
+
+Input files (in specified directory):
+  SleepU 6294_*.csv                              - SpO2, HR, Motion
+  breathing_analysis_report_respiratory_rate.csv  - Breaths per minute
+  breathing_analysis_report_apnea_events.csv     - Apnea gap events
+  breathing_analysis_report_obstructions.csv     - Obstruction events
+
+Usage: python generate_sleep_dashboard.py <input_directory>
+"""
+
+import os
+import sys
+import csv
+import json
+import glob
+from datetime import datetime, timedelta
+
+
+def find_input_files(input_dir):
+    """Locate the four required CSV files. Returns dict of paths or raises."""
+    files = {}
+
+    # SleepU file (wildcard date)
+    pattern = os.path.join(input_dir, "SleepU 6294_*.csv")
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(f"No file matching 'SleepU 6294_*.csv' in {input_dir}")
+    if len(matches) > 1:
+        print(f"  Note: found {len(matches)} SleepU files, using {os.path.basename(matches[-1])}")
+    files['sleepu'] = matches[-1]
+
+    # Breathing analysis files (exact names)
+    exact = {
+        'resp_rate': 'breathing_analysis_report_respiratory_rate.csv',
+        'apnea':     'breathing_analysis_report_apnea_events.csv',
+        'obstruct':  'breathing_analysis_report_obstructions.csv',
+    }
+    for key, name in exact.items():
+        path = os.path.join(input_dir, name)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Missing required file: {name}")
+        files[key] = path
+
+    return files
+
+
+def parse_sleepu_time(ts_str):
+    """Parse SleepU timestamp like '22:42:27 04/02/2026' -> datetime."""
+    return datetime.strptime(ts_str.strip(), "%H:%M:%S %d/%m/%Y")
+
+
+def parse_iso_time(ts_str):
+    """Parse timestamp like '2026-02-04 22:45:00' -> datetime."""
+    return datetime.strptime(ts_str.strip(), "%Y-%m-%d %H:%M:%S")
+
+
+def dt_to_minutes(dt, ref_date):
+    """Convert datetime to minutes since midnight of ref_date."""
+    delta = dt - datetime.combine(ref_date, datetime.min.time())
+    return round(delta.total_seconds() / 60.0, 1)
+
+
+def read_sleepu(filepath, ref_date):
+    """Read SleepU CSV, downsample 8x. Returns list of [t, spo2, hr, motion]."""
+    data = []
+    with open(filepath, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            if i % 8 != 0:
+                continue
+            try:
+                dt = parse_sleepu_time(row['Time'])
+            except (ValueError, KeyError):
+                continue
+
+            t = dt_to_minutes(dt, ref_date)
+
+            o2 = row.get('Oxygen Level', '').strip()
+            pulse = row.get('Pulse Rate', '').strip()
+            motion = row.get('Motion', '').strip()
+
+            if o2 == '--' or pulse == '--':
+                continue
+            o2v = int(o2)
+            pv = int(pulse)
+            mv = int(motion) if motion != '--' else 0
+
+            if o2v < 70 or pv < 30:
+                continue
+
+            data.append([t, o2v, pv, mv])
+    return data
+
+
+def read_resp_rate(filepath, ref_date):
+    """Read respiratory rate CSV. Returns list of [t, breaths_per_min]."""
+    data = []
+    with open(filepath, newline='') as f:
+        for row in csv.DictReader(f):
+            try:
+                dt = parse_iso_time(row['timestamp'])
+            except (ValueError, KeyError):
+                continue
+            t = dt_to_minutes(dt, ref_date)
+            data.append([t, int(row['breaths_per_minute'].strip())])
+    return data
+
+
+def read_apnea(filepath, ref_date):
+    """Read apnea events CSV. Returns list of [t, duration_sec]."""
+    data = []
+    with open(filepath, newline='') as f:
+        for row in csv.DictReader(f):
+            try:
+                dt = parse_iso_time(row['wall_clock_time'])
+            except (ValueError, KeyError):
+                continue
+            t = dt_to_minutes(dt, ref_date)
+            data.append([t, float(row['duration_sec'].strip())])
+    return data
+
+
+def read_obstructions(filepath, ref_date):
+    """Read obstructions CSV. Returns list of [t, duration_sec, severity_flag]."""
+    data = []
+    with open(filepath, newline='') as f:
+        for row in csv.DictReader(f):
+            try:
+                dt = parse_iso_time(row['wall_clock_time'])
+            except (ValueError, KeyError):
+                continue
+            t = dt_to_minutes(dt, ref_date)
+            sev = 1 if row['severity'].strip() == 'severe' else 0
+            data.append([t, float(row['duration_sec'].strip()), sev])
+    return data
+
+
+def compute_time_range(sleepu, rr):
+    """Return (t_min, t_max) with some padding, and formatted subtitle info."""
+    all_t = [p[0] for p in sleepu] + [p[0] for p in rr]
+    t_min = min(all_t)
+    t_max = max(all_t)
+    # Pad by 3 minutes on each side
+    return t_min - 3, t_max + 3
+
+
+def minutes_to_clock(m):
+    """Convert minutes-since-midnight to 'HH:MM' string."""
+    h = int(m / 60) % 24
+    mn = int(m % 60)
+    return f"{h:02d}:{mn:02d}"
+
+
+def format_duration(t_min, t_max):
+    """Format duration as '~Xh Ym'."""
+    dur = t_max - t_min
+    hours = int(dur // 60)
+    mins = int(dur % 60)
+    return f"~{hours}h {mins:02d}m"
+
+
+# =============================================================================
+# HTML Template
+# =============================================================================
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sleep Study — %%TITLE_DATE%%</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0e14;
+    color: #c5cdd8;
+    font-family: 'IBM Plex Sans', sans-serif;
+    padding: 8px 32px 0;
+    min-height: 100vh;
+    overflow: hidden;
+  }
+
+  h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: #e8ecf0;
+    margin-bottom: 4px;
+    letter-spacing: -0.3px;
+  }
+
+  .subtitle {
+    font-size: 13px;
+    color: #6b7a8d;
+    margin-bottom: 8px;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  .chart-container {
+    position: relative;
+    width: 100%;
+  }
+
+  canvas {
+    display: block;
+    width: 100% !important;
+  }
+
+  canvas.zoomed { cursor: grab; }
+  canvas.zoomed.panning { cursor: grabbing; }
+
+  .legend {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+    padding: 6px 16px;
+    background: #111822;
+    border-radius: 6px;
+    border: 1px solid #1e2a38;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-family: 'IBM Plex Mono', monospace;
+    color: #8899aa;
+  }
+
+  .legend-swatch {
+    width: 14px;
+    height: 4px;
+    border-radius: 2px;
+  }
+
+  .legend-swatch.dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+
+  .legend-swatch.bar {
+    width: 14px;
+    height: 10px;
+    border-radius: 2px;
+  }
+
+  .tooltip-box {
+    position: absolute;
+    display: none;
+    pointer-events: none;
+    background: #161e28;
+    border: 1px solid #2a3a4a;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #c5cdd8;
+    z-index: 100;
+    white-space: nowrap;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+
+  .tooltip-box .tt-time {
+    font-weight: 600;
+    color: #e8ecf0;
+    margin-bottom: 4px;
+  }
+
+  .tooltip-box .tt-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 2px 0;
+  }
+
+  .tooltip-box .tt-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .crosshair {
+    position: absolute;
+    top: 0;
+    width: 1px;
+    background: rgba(100,140,180,0.25);
+    pointer-events: none;
+    display: none;
+  }
+
+  .theme-toggle {
+    position: fixed;
+    top: 12px;
+    right: 16px;
+    background: #1a2430;
+    border: 1px solid #2a3a4a;
+    color: #8899aa;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 5px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    z-index: 200;
+  }
+  .theme-toggle:hover { background: #243040; color: #b0c0d0; }
+
+  body.light-theme { background: #ffffff; color: #333; }
+  body.light-theme h1 { color: #111; }
+  body.light-theme .subtitle { color: #555; }
+  body.light-theme .legend { background: #f0f0f0; border-color: #ccc; }
+  body.light-theme .legend-item { color: #555; }
+  body.light-theme .tooltip-box { background: #fff; border-color: #bbb; color: #333; box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
+  body.light-theme .tooltip-box .tt-time { color: #111; }
+  body.light-theme .crosshair { background: rgba(0,0,0,0.2); }
+  body.light-theme .theme-toggle { background: #e8e8e8; border-color: #ccc; color: #555; }
+  body.light-theme .theme-toggle:hover { background: #ddd; color: #333; }
+
+  @media print {
+    body { background: #fff !important; color: #333 !important; padding: 4px 16px !important; overflow: visible !important; }
+    h1 { color: #111 !important; }
+    .subtitle { color: #555 !important; }
+    .legend { background: #f5f5f5 !important; border-color: #ccc !important; }
+    .legend-item { color: #555 !important; }
+    .theme-toggle { display: none !important; }
+    #resetZoom { display: none !important; }
+    .tooltip-box, .crosshair { display: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">&#x263C; Light</button>
+<button class="theme-toggle" id="resetZoom" style="right:100px; display:none;" onclick="resetZoom()">&#x21BA; Reset Zoom</button>
+
+<h1>Overnight Sleep Study</h1>
+<div class="subtitle">%%SUBTITLE%%</div>
+
+<div class="legend" id="legendBar">
+  <div class="legend-item"><div class="legend-swatch" id="lsw-spo2" style="background:#48b8e8"></div>SpO&#x2082; (%)</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-hr" style="background:#e85878"></div>Heart Rate (bpm)</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-hrma" style="background:rgba(255,220,80,0.85)"></div>HR Trend (~5m avg)</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-resp" style="background:#58d888"></div>Resp. Rate (br/min)</div>
+  <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnea" style="background:rgba(255,80,60,0.5)"></div>Apnea Event</div>
+  <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnealong" style="background:rgba(255,220,40,0.8)"></div>Apnea &gt;50s</div>
+  <div class="legend-item"><div class="legend-swatch dot" id="lsw-omod" style="background:#f0a030"></div>Obstruction (mod)</div>
+  <div class="legend-item"><div class="legend-swatch dot" id="lsw-osev" style="background:#ff4040"></div>Obstruction (sev)</div>
+  <div class="legend-item"><div class="legend-swatch bar" id="lsw-mot" style="background:rgba(160,140,220,0.5)"></div>Motion</div>
+</div>
+
+<div class="chart-container" id="chartArea">
+  <canvas id="mainCanvas"></canvas>
+  <div class="crosshair" id="crosshair"></div>
+  <div class="tooltip-box" id="tooltip"></div>
+</div>
+
+<script>
+// ============================================================
+// DATA (minutes since midnight of recording start date)
+// ============================================================
+const RAW = %%DATA_JSON%%;
+const T_MIN_FULL = %%T_MIN%%;
+const T_MAX_FULL = %%T_MAX%%;
+let T_MIN = T_MIN_FULL;
+let T_MAX = T_MAX_FULL;
+
+// ============================================================
+// Color Themes
+// ============================================================
+const THEMES = {
+  dark: {
+    panelBg: '#0d1219',
+    panelBorder: '#1a2430',
+    gridLine: 'rgba(30,42,56,0.6)',
+    gridLineX: 'rgba(30,42,56,0.4)',
+    yAxisText: '#4a5a6a',
+    xAxisText: '#5a6a7a',
+    xAxisLine: '#1a2430',
+    spo2: '#48b8e8',
+    hr: '#e85878',
+    resp: '#58d888',
+    respArea: 'rgba(88,216,136,0.12)',
+    spo2Ref: 'rgba(255,80,60,0.3)',
+    evtLabel: '#ff6050',
+    apneaBar: 'rgba(255,70,50,0.35)',
+    obstrSevere: '#ff4040',
+    obstrMod: '#f0a030',
+    sevLabel: 'rgba(255,70,50,0.4)',
+    modLabel: 'rgba(240,160,48,0.4)',
+    motionBar: 'rgba(160,140,220,0.7)',
+    motionAxis: 'rgba(160,140,220,0.7)',
+    hrMA: 'rgba(255,220,80,0.85)',
+    apneaLong: 'rgba(255,220,40,0.8)',
+    apneaLongText: '#ffe060',
+    spo2DipText: '#ff6060',
+  },
+  light: {
+    panelBg: '#f8f8f8',
+    panelBorder: '#cccccc',
+    gridLine: 'rgba(0,0,0,0.12)',
+    gridLineX: 'rgba(0,0,0,0.10)',
+    yAxisText: '#444444',
+    xAxisText: '#444444',
+    xAxisLine: '#999999',
+    spo2: '#0077aa',
+    hr: '#cc2244',
+    resp: '#228844',
+    respArea: 'rgba(34,136,68,0.10)',
+    spo2Ref: 'rgba(200,50,30,0.4)',
+    evtLabel: '#cc3322',
+    apneaBar: 'rgba(200,50,30,0.4)',
+    obstrSevere: '#cc2222',
+    obstrMod: '#cc7700',
+    sevLabel: 'rgba(200,50,30,0.5)',
+    modLabel: 'rgba(200,120,0,0.5)',
+    motionBar: 'rgba(80,60,160,0.65)',
+    motionAxis: 'rgba(80,60,140,0.8)',
+    hrMA: 'rgba(180,120,0,0.85)',
+    apneaLong: 'rgba(200,160,0,0.75)',
+    apneaLongText: '#806000',
+    spo2DipText: '#cc0000',
+  }
+};
+let theme = THEMES.dark;
+
+function updateLegendColors() {
+  document.getElementById('lsw-spo2').style.background = theme.spo2;
+  document.getElementById('lsw-hr').style.background = theme.hr;
+  document.getElementById('lsw-hrma').style.background = theme.hrMA;
+  document.getElementById('lsw-resp').style.background = theme.resp;
+  document.getElementById('lsw-apnea').style.background = theme.apneaBar;
+  document.getElementById('lsw-apnealong').style.background = theme.apneaLong;
+  document.getElementById('lsw-omod').style.background = theme.obstrMod;
+  document.getElementById('lsw-osev').style.background = theme.obstrSevere;
+  document.getElementById('lsw-mot').style.background = theme.motionBar;
+}
+
+function toggleTheme() {
+  const body = document.body;
+  const btn = document.getElementById('themeToggle');
+  if (body.classList.contains('light-theme')) {
+    body.classList.remove('light-theme');
+    theme = THEMES.dark;
+    btn.innerHTML = '&#x263C; Light';
+  } else {
+    body.classList.add('light-theme');
+    theme = THEMES.light;
+    btn.innerHTML = '&#x263D; Dark';
+  }
+  draw();
+  updateLegendColors();
+}
+
+// Auto-switch theme for printing
+window.addEventListener('beforeprint', () => {
+  if (!document.body.classList.contains('light-theme')) {
+    document.body.classList.add('light-theme');
+    document.body.dataset.wasdk = '1';
+    theme = THEMES.light;
+    draw();
+    updateLegendColors();
+  }
+});
+window.addEventListener('afterprint', () => {
+  if (document.body.dataset.wasdk === '1') {
+    document.body.classList.remove('light-theme');
+    delete document.body.dataset.wasdk;
+    theme = THEMES.dark;
+    draw();
+    updateLegendColors();
+  }
+});
+
+// ============================================================
+// Layout (dynamic — fills viewport)
+// ============================================================
+const canvas = document.getElementById('mainCanvas');
+const ctx = canvas.getContext('2d');
+
+const DPR = window.devicePixelRatio || 1;
+// Panel proportional weights: SpO2, HR, Resp, Events, Motion
+const PANEL_WEIGHTS = [0.25, 0.25, 0.20, 0.20, 0.10];
+const PANEL_GAP = 4;
+const MARGIN = { top: 6, right: 24, bottom: 28, left: 54 };
+
+let W, TOTAL_H, PANEL_HEIGHTS, plotW;
+
+function computeLayout() {
+  W = canvas.parentElement.clientWidth;
+  // Available height = viewport minus header elements
+  const headerH = document.getElementById('chartArea').getBoundingClientRect().top;
+  const availH = window.innerHeight - headerH - 4;
+  TOTAL_H = Math.max(300, availH);
+  const panelSpace = TOTAL_H - MARGIN.top - MARGIN.bottom - PANEL_GAP * (PANEL_WEIGHTS.length - 1);
+  PANEL_HEIGHTS = PANEL_WEIGHTS.map(w => Math.round(w * panelSpace));
+  plotW = W - MARGIN.left - MARGIN.right;
+
+  canvas.width = W * DPR;
+  canvas.height = TOTAL_H * DPR;
+  canvas.style.height = TOTAL_H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  const crosshair = document.getElementById('crosshair');
+  crosshair.style.height = (TOTAL_H - MARGIN.bottom) + 'px';
+}
+
+computeLayout();
+
+function tToX(t) { return MARGIN.left + (t - T_MIN) / (T_MAX - T_MIN) * plotW; }
+function xToT(x) { return T_MIN + (x - MARGIN.left) / plotW * (T_MAX - T_MIN); }
+
+function minToClockStr(m) {
+  let h = Math.floor(m / 60) % 24;
+  let mn = Math.floor(m % 60);
+  let s = Math.round((m % 1) * 60);
+  let str = `${h.toString().padStart(2,'0')}:${mn.toString().padStart(2,'0')}`;
+  if (s !== 0) str += `:${s.toString().padStart(2,'0')}`;
+  return str;
+}
+
+function minToClockStrFull(m) {
+  let h = Math.floor(m / 60) % 24;
+  let mn = Math.floor(m % 60);
+  let s = Math.round((m % 1) * 60);
+  return `${h.toString().padStart(2,'0')}:${mn.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+}
+
+function panelTop(i) {
+  let y = MARGIN.top;
+  for (let j = 0; j < i; j++) y += PANEL_HEIGHTS[j] + PANEL_GAP;
+  return y;
+}
+
+function valToY(v, vMin, vMax, panelIdx) {
+  const pt = panelTop(panelIdx);
+  const ph = PANEL_HEIGHTS[panelIdx];
+  const pad = 6;
+  return pt + pad + (1 - (v - vMin) / (vMax - vMin)) * (ph - 2*pad);
+}
+
+// ============================================================
+// Drawing helpers
+// ============================================================
+function drawPanelBg(idx) {
+  const y = panelTop(idx);
+  const h = PANEL_HEIGHTS[idx];
+  ctx.fillStyle = theme.panelBg;
+  ctx.fillRect(MARGIN.left, y, plotW, h);
+  ctx.strokeStyle = theme.panelBorder;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(MARGIN.left, y, plotW, h);
+}
+
+function drawLine(data, tKey, vKey, vMin, vMax, panelIdx, color, lineWidth) {
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth || 1.2;
+  ctx.lineJoin = 'round';
+  let first = true;
+  for (const pt of data) {
+    const x = tToX(pt[tKey]);
+    const y = valToY(pt[vKey], vMin, vMax, panelIdx);
+    if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
+    if (first) { ctx.moveTo(x, y); first = false; }
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawArea(data, tKey, vKey, vMin, vMax, panelIdx, fillColor) {
+  const pt0 = panelTop(panelIdx);
+  const ph = PANEL_HEIGHTS[panelIdx];
+  const baseY = pt0 + ph - 6;
+  ctx.beginPath();
+  let first = true;
+  let lastX;
+  for (const pt of data) {
+    const x = tToX(pt[tKey]);
+    const y = valToY(pt[vKey], vMin, vMax, panelIdx);
+    if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
+    if (first) { ctx.moveTo(x, baseY); ctx.lineTo(x, y); first = false; }
+    else ctx.lineTo(x, y);
+    lastX = x;
+  }
+  if (lastX !== undefined) {
+    ctx.lineTo(lastX, baseY);
+    ctx.closePath();
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+  }
+}
+
+function drawYAxis(vMin, vMax, panelIdx, ticks, unit, color) {
+  ctx.font = '10px IBM Plex Mono';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (const v of ticks) {
+    const y = valToY(v, vMin, vMax, panelIdx);
+    ctx.strokeStyle = theme.gridLine;
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(MARGIN.left, y);
+    ctx.lineTo(MARGIN.left + plotW, y);
+    ctx.stroke();
+    ctx.fillStyle = theme.yAxisText;
+    ctx.fillText(v.toString(), MARGIN.left - 6, y);
+  }
+  ctx.save();
+  ctx.translate(14, panelTop(panelIdx) + PANEL_HEIGHTS[panelIdx]/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.textAlign = 'center';
+  ctx.font = '500 10px IBM Plex Mono';
+  ctx.fillStyle = color;
+  ctx.fillText(unit, 0, 0);
+  ctx.restore();
+}
+
+function drawXAxis() {
+  const y = TOTAL_H - MARGIN.bottom + 4;
+  ctx.font = '11px IBM Plex Mono';
+  ctx.fillStyle = theme.xAxisText;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+
+  // Work in integer seconds to avoid floating-point modulo errors
+  const rangeMin = T_MAX - T_MIN;
+  const rangeSec = rangeMin * 60;
+
+  // Adaptive intervals (all in seconds)
+  let majorSec, minorSec, tickSec;
+  // tickSec = smallest marks (short hairline at bottom only)
+  // minorSec = intermediate (dashed line through panels)
+  // majorSec = labelled (solid line through panels)
+  if (rangeSec > 14400)     { majorSec = 3600; minorSec = 1800; tickSec = 0; }
+  else if (rangeSec > 5400) { majorSec = 1800; minorSec = 900;  tickSec = 0; }
+  else if (rangeSec > 2700) { majorSec = 900;  minorSec = 300;  tickSec = 60; }
+  else if (rangeSec > 1200) { majorSec = 300;  minorSec = 60;   tickSec = 0; }
+  else if (rangeSec > 480)  { majorSec = 120;  minorSec = 60;   tickSec = 10; }
+  else if (rangeSec > 180)  { majorSec = 60;   minorSec = 10;   tickSec = 0; }
+  else                      { majorSec = 30;   minorSec = 10;   tickSec = 0; }
+
+  const finest = tickSec > 0 ? tickSec : minorSec;
+  const tMinSec = Math.round(T_MIN * 60);
+  const tMaxSec = Math.round(T_MAX * 60);
+  const firstSec = Math.ceil(tMinSec / finest) * finest;
+
+  for (let s = firstSec; s <= tMaxSec; s += finest) {
+    const tMin = s / 60;
+    const x = tToX(tMin);
+    if (x < MARGIN.left - 1 || x > MARGIN.left + plotW + 1) continue;
+
+    const isMajor = (s % majorSec) === 0;
+    const isMinor = !isMajor && (s % minorSec) === 0;
+
+    if (isMajor) {
+      ctx.strokeStyle = theme.gridLineX;
+      ctx.lineWidth = 0.8;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(x, MARGIN.top);
+      ctx.lineTo(x, TOTAL_H - MARGIN.bottom);
+      ctx.stroke();
+      // Major tick mark on axis
+      ctx.strokeStyle = theme.xAxisText;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(x, TOTAL_H - MARGIN.bottom - 7);
+      ctx.lineTo(x, TOTAL_H - MARGIN.bottom);
+      ctx.stroke();
+      ctx.fillText(minToClockStr(tMin), x, y);
+    } else if (isMinor) {
+      // Minor ticks: solid marks on axis, 5px tall
+      ctx.strokeStyle = theme.xAxisText;
+      ctx.lineWidth = 0.7;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(x, TOTAL_H - MARGIN.bottom - 5);
+      ctx.lineTo(x, TOTAL_H - MARGIN.bottom);
+      ctx.stroke();
+    } else {
+      // Finest tick marks: short solid marks, 3px tall
+      ctx.strokeStyle = theme.xAxisText;
+      ctx.lineWidth = 0.4;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(x, TOTAL_H - MARGIN.bottom - 3);
+      ctx.lineTo(x, TOTAL_H - MARGIN.bottom);
+      ctx.stroke();
+    }
+  }
+  ctx.strokeStyle = theme.xAxisLine;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(MARGIN.left, TOTAL_H - MARGIN.bottom);
+  ctx.lineTo(MARGIN.left + plotW, TOTAL_H - MARGIN.bottom);
+  ctx.stroke();
+}
+
+// ============================================================
+// Prepare data arrays
+// ============================================================
+const spo2Data  = RAW.sleepU.map(d => ({t: d[0], v: d[1]}));
+const hrData    = RAW.sleepU.map(d => ({t: d[0], v: d[2]}));
+const motData   = RAW.sleepU.map(d => ({t: d[0], v: d[3]}));
+const rrData    = RAW.rr.map(d => ({t: d[0], v: d[1]}));
+const apneaData = RAW.apnea.map(d => ({t: d[0], dur: d[1]}));
+const obstrData = RAW.obstr.map(d => ({t: d[0], dur: d[1], sev: d[2]}));
+
+// ============================================================
+// Compute dynamic Y-axis ranges from data
+// ============================================================
+const spo2Vals = spo2Data.map(d => d.v);
+const hrVals = hrData.map(d => d.v);
+const rrVals = rrData.map(d => d.v);
+
+const SPO2_MIN = Math.max(70, Math.min(...spo2Vals) - 2);
+const SPO2_MAX = 100;
+const HR_MIN = Math.max(30, Math.floor((Math.min(...hrVals) - 3) / 5) * 5);
+const HR_MAX = Math.min(200, Math.ceil((Math.max(...hrVals) + 3) / 5) * 5);
+const RR_MIN = 0;
+const RR_MAX = Math.ceil((Math.max(...rrVals) + 2) / 5) * 5;
+const MOT_MAX = Math.max(10, Math.ceil(Math.max(...motData.map(d => d.v)) / 5) * 5);
+
+// Compute apnea Y-axis range (seconds)
+const APNEA_MAX_DUR = apneaData.length > 0
+  ? Math.ceil(Math.max(...apneaData.map(d => d.dur)) / 10) * 10
+  : 60;
+
+// Compute HR moving average (window ~5 minutes centered)
+const HR_MA_WINDOW = 75;  // samples each side (8x downsample, ~5 min half-window)
+const hrMA = [];
+for (let i = 0; i < hrData.length; i++) {
+  let lo = Math.max(0, i - HR_MA_WINDOW);
+  let hi = Math.min(hrData.length - 1, i + HR_MA_WINDOW);
+  let sum = 0;
+  for (let j = lo; j <= hi; j++) sum += hrData[j].v;
+  hrMA.push({t: hrData[i].t, v: Math.round(sum / (hi - lo + 1) * 10) / 10});
+}
+
+// Detect SpO2 dips below 85% (local minima with >=20 sample spacing)
+const SPO2_DIP_THRESH = 85;
+const spo2Dips = [];
+const DIP_MIN_SEP = 20; // minimum samples between reported dips
+for (let i = 1; i < spo2Data.length - 1; i++) {
+  const v = spo2Data[i].v;
+  if (v >= SPO2_DIP_THRESH) continue;
+  // Check it's a local minimum within a window of ±5 samples
+  let isMin = true;
+  for (let j = Math.max(0, i-5); j <= Math.min(spo2Data.length-1, i+5); j++) {
+    if (j !== i && spo2Data[j].v < v) { isMin = false; break; }
+  }
+  if (!isMin) continue;
+  // Enforce spacing from previous dip
+  if (spo2Dips.length > 0 && i - spo2Dips[spo2Dips.length-1].idx < DIP_MIN_SEP) {
+    // Keep the deeper one
+    if (v < spo2Dips[spo2Dips.length-1].v) spo2Dips[spo2Dips.length-1] = {idx: i, t: spo2Data[i].t, v};
+    continue;
+  }
+  spo2Dips.push({idx: i, t: spo2Data[i].t, v});
+}
+
+// Generate tick arrays
+function makeTicks(lo, hi, step) {
+  const ticks = [];
+  for (let v = Math.ceil(lo/step)*step; v <= hi; v += step) ticks.push(v);
+  return ticks;
+}
+
+const spo2Ticks = makeTicks(SPO2_MIN, SPO2_MAX, 5);
+const hrTicks = makeTicks(HR_MIN, HR_MAX, (HR_MAX - HR_MIN > 40) ? 10 : 5);
+const rrTicks = makeTicks(RR_MIN, RR_MAX, 5);
+const apneaTicks = makeTicks(0, APNEA_MAX_DUR, APNEA_MAX_DUR > 80 ? 20 : 10);
+const motTicks = makeTicks(0, MOT_MAX, MOT_MAX > 30 ? Math.ceil(MOT_MAX / 3 / 5) * 5 : 5);
+
+// ============================================================
+// DRAW
+// ============================================================
+function draw() {
+  ctx.clearRect(0, 0, W, TOTAL_H);
+  for (let i = 0; i < 5; i++) drawPanelBg(i);
+  drawXAxis();
+
+  // Panel 0: SpO2
+  drawYAxis(SPO2_MIN, SPO2_MAX, 0, spo2Ticks, 'SpO\u2082 %', theme.spo2);
+  const y90 = valToY(90, SPO2_MIN, SPO2_MAX, 0);
+  ctx.strokeStyle = theme.spo2Ref;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4,4]);
+  ctx.beginPath(); ctx.moveTo(MARGIN.left, y90); ctx.lineTo(MARGIN.left+plotW, y90); ctx.stroke();
+  ctx.setLineDash([]);
+  drawLine(spo2Data, 't', 'v', SPO2_MIN, SPO2_MAX, 0, theme.spo2, 1.0);
+
+  // Label SpO2 dips below 85%
+  ctx.font = 'bold 11px IBM Plex Mono';
+  ctx.fillStyle = theme.spo2DipText;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (const dip of spo2Dips) {
+    const dx = tToX(dip.t);
+    const dy = valToY(dip.v, SPO2_MIN, SPO2_MAX, 0);
+    ctx.fillText(dip.v + '%', dx, dy + 3);
+  }
+
+  // Panel 1: HR
+  drawYAxis(HR_MIN, HR_MAX, 1, hrTicks, 'HR bpm', theme.hr);
+  drawLine(hrData, 't', 'v', HR_MIN, HR_MAX, 1, theme.hr, 1.0);
+  drawLine(hrMA, 't', 'v', HR_MIN, HR_MAX, 1, theme.hrMA, 2.0);
+
+  // Panel 2: Respiratory Rate
+  drawYAxis(RR_MIN, RR_MAX, 2, rrTicks, 'Resp br/m', theme.resp);
+  drawArea(rrData, 't', 'v', RR_MIN, RR_MAX, 2, theme.respArea);
+  drawLine(rrData, 't', 'v', RR_MIN, RR_MAX, 2, theme.resp, 1.2);
+
+  // Panel 3: Events (apnea bars scaled to seconds Y-axis)
+  const EVT_TOP = panelTop(3);
+  const EVT_H = PANEL_HEIGHTS[3];
+  drawYAxis(0, APNEA_MAX_DUR, 3, apneaTicks, 'Apnea (s)', theme.evtLabel);
+
+  // Draw all apnea bars first (clipped to plot area)
+  const apneaBars = [];
+  const plotLeft = MARGIN.left;
+  const plotRight = MARGIN.left + plotW;
+  for (const a of apneaData) {
+    let x = tToX(a.t);
+    const w = Math.max(1.5, (a.dur / 60) / (T_MAX - T_MIN) * plotW);
+    let x2 = x + w;
+    // Clip to plot area
+    if (x2 < plotLeft || x > plotRight) continue;
+    x = Math.max(x, plotLeft);
+    x2 = Math.min(x2, plotRight);
+    const clampDur = Math.min(a.dur, APNEA_MAX_DUR);
+    const barBot = EVT_TOP + EVT_H - 6;
+    const barTop = valToY(clampDur, 0, APNEA_MAX_DUR, 3);
+    const h = barBot - barTop;
+    const isLong = a.dur > 50;
+    ctx.fillStyle = isLong ? theme.apneaLong : theme.apneaBar;
+    ctx.fillRect(x, barTop, x2 - x, h);
+    apneaBars.push({x, w: x2 - x, barTop, barBot, dur: a.dur, isLong});
+  }
+
+  // Collect obstruction dot bounding boxes
+  const obstrBoxes = [];
+  for (const o of obstrData) {
+    const ox = tToX(o.t);
+    if (ox < plotLeft || ox > plotRight) continue;
+    const oy = EVT_TOP + (o.sev === 1 ? 6 : 16);
+    const r = o.sev === 1 ? 2.5 : 2;
+    obstrBoxes.push({x: ox - r, y: oy - r, w: r*2, h: r*2});
+    ctx.beginPath();
+    ctx.arc(ox, oy, r, 0, Math.PI*2);
+    ctx.fillStyle = o.sev === 1 ? theme.obstrSevere : theme.obstrMod;
+    ctx.fill();
+  }
+
+  // Place >50s apnea labels: prefer left/right of bar, no leader lines
+  ctx.font = 'bold 11px IBM Plex Mono';
+  const LABEL_H = 12;
+  const LABEL_GAP = 3;
+  const placedLabels = []; // {x, y, w, h} bounding boxes
+
+  function boxOverlaps(ax, ay, aw, ah, bx, by, bw, bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  function labelCollides(lx, ly, lw) {
+    for (const ob of obstrBoxes) {
+      if (boxOverlaps(lx, ly, lw, LABEL_H, ob.x - 2, ob.y - 2, ob.w + 4, ob.h + 4)) return true;
+    }
+    for (const pl of placedLabels) {
+      if (boxOverlaps(lx, ly, lw, LABEL_H, pl.x, pl.y, pl.w, pl.h)) return true;
+    }
+    for (const b of apneaBars) {
+      if (boxOverlaps(lx, ly, lw, LABEL_H, b.x - 1, b.barTop, b.w + 2, b.barBot - b.barTop)) return true;
+    }
+    return false;
+  }
+
+  // Collect long bars and group into clusters (nearby = within 40px)
+  const longBars = apneaBars.filter(b => b.isLong);
+  const CLUSTER_DIST = 40;
+  const clusters = [];
+  for (const b of longBars) {
+    const cx = b.x + b.w / 2;
+    if (clusters.length > 0) {
+      const last = clusters[clusters.length - 1];
+      const lastCx = last[last.length - 1].x + last[last.length - 1].w / 2;
+      if (cx - lastCx < CLUSTER_DIST) {
+        last.push(b);
+        continue;
+      }
+    }
+    clusters.push([b]);
+  }
+
+  for (const cluster of clusters) {
+    for (let ci = 0; ci < cluster.length; ci++) {
+      const b = cluster[ci];
+      const label = Math.round(b.dur) + 's';
+      const lw = ctx.measureText(label).width + 4;
+      const midY = b.barTop + Math.min(12, (b.barBot - b.barTop) * 0.3);
+
+      // Build ordered candidate positions
+      const candidates = [];
+      const leftX = b.x - lw - LABEL_GAP;
+      const rightX = b.x + b.w + LABEL_GAP;
+      const aboveX = b.x + b.w/2 - lw/2;
+      const aboveY = b.barTop - LABEL_H - 2;
+
+      if (cluster.length === 1) {
+        // Isolated: try right, left, then above
+        candidates.push({x: rightX, y: midY});
+        candidates.push({x: leftX, y: midY});
+        candidates.push({x: aboveX, y: aboveY});
+      } else if (cluster.length === 2) {
+        // Pair: first goes left, second goes right
+        if (ci === 0) {
+          candidates.push({x: leftX, y: midY});
+          candidates.push({x: rightX, y: midY});
+          candidates.push({x: aboveX, y: aboveY});
+        } else {
+          candidates.push({x: rightX, y: midY});
+          candidates.push({x: leftX, y: midY});
+          candidates.push({x: aboveX, y: aboveY});
+        }
+      } else {
+        // 3+: outer go outward, middle ones go above then left/right
+        if (ci === 0) {
+          candidates.push({x: leftX, y: midY});
+          candidates.push({x: aboveX, y: aboveY});
+          candidates.push({x: rightX, y: midY});
+        } else if (ci === cluster.length - 1) {
+          candidates.push({x: rightX, y: midY});
+          candidates.push({x: aboveX, y: aboveY});
+          candidates.push({x: leftX, y: midY});
+        } else {
+          candidates.push({x: aboveX, y: aboveY});
+          candidates.push({x: rightX, y: midY});
+          candidates.push({x: leftX, y: midY});
+        }
+      }
+
+      // Try each candidate, pick first that fits
+      let placed = false;
+      for (const c of candidates) {
+        if (c.x < MARGIN.left - 4 || c.x + lw > MARGIN.left + plotW + 4) continue;
+        if (c.y < EVT_TOP) continue;
+        if (!labelCollides(c.x, c.y, lw)) {
+          ctx.fillStyle = theme.apneaLongText;
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'top';
+          ctx.fillText(label, c.x, c.y);
+          placedLabels.push({x: c.x, y: c.y, w: lw, h: LABEL_H});
+          placed = true;
+          break;
+        }
+      }
+      // Fallback: draw to right regardless
+      if (!placed) {
+        const fx = rightX;
+        const fy = midY;
+        ctx.fillStyle = theme.apneaLongText;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillText(label, fx, fy);
+        placedLabels.push({x: fx, y: fy, w: lw, h: LABEL_H});
+      }
+    }
+  }
+
+  // Panel 4: Motion
+  const MOT_TOP = panelTop(4);
+  const MOT_H = PANEL_HEIGHTS[4];
+  drawYAxis(0, MOT_MAX, 4, motTicks, 'Motion', theme.motionAxis);
+  for (const m of motData) {
+    if (m.v === 0) continue;
+    const x = tToX(m.t);
+    if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
+    const barH = Math.max(1, (Math.min(m.v, MOT_MAX) / MOT_MAX) * (MOT_H - 8));
+    const y = MOT_TOP + MOT_H - 3 - barH;
+    ctx.fillStyle = theme.motionBar;
+    ctx.fillRect(x - 0.5, y, 1.5, barH);
+  }
+}
+
+draw();
+
+// ============================================================
+// Tooltip / Crosshair
+// ============================================================
+const tooltip = document.getElementById('tooltip');
+const chartArea = document.getElementById('chartArea');
+
+function findNearest(arr, t) {
+  const maxDist = Math.max(0.5, (T_MAX - T_MIN) * 0.006); // ~0.6% of visible range
+  let best = null, bestDist = Infinity;
+  for (const pt of arr) {
+    const d = Math.abs(pt.t - t);
+    if (d < bestDist) { bestDist = d; best = pt; }
+  }
+  return bestDist < maxDist ? best : null;
+}
+
+chartArea.addEventListener('mousemove', (e) => {
+  if (panState) {
+    crosshair.style.display = 'none';
+    tooltip.style.display = 'none';
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+
+  if (mx < MARGIN.left || mx > MARGIN.left + plotW || my > TOTAL_H - MARGIN.bottom) {
+    crosshair.style.display = 'none';
+    tooltip.style.display = 'none';
+    return;
+  }
+
+  const t = xToT(mx);
+  crosshair.style.display = 'block';
+  crosshair.style.left = mx + 'px';
+
+  const sp = findNearest(spo2Data, t);
+  const hr = findNearest(hrData, t);
+  const hrm = findNearest(hrMA, t);
+  const rr = findNearest(rrData, t);
+  const mo = findNearest(motData, t);
+
+  let apnStr = '';
+  for (const a of apneaData) {
+    if (t >= a.t && t <= a.t + a.dur/60) {
+      apnStr = `${a.dur.toFixed(0)}s apnea`;
+      break;
+    }
+  }
+
+  let html = `<div class="tt-time">${minToClockStrFull(t)}</div>`;
+  if (sp) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.spo2}"></div>SpO\u2082: ${sp.v}%</div>`;
+  if (hr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hr}"></div>HR: ${hr.v} bpm</div>`;
+  if (hrm) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hrMA}"></div>HR avg: ${hrm.v} bpm</div>`;
+  if (rr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.resp}"></div>Resp: ${rr.v} br/min</div>`;
+  if (mo && mo.v > 0) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.motionAxis}"></div>Motion: ${mo.v}</div>`;
+  if (apnStr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.obstrSevere}"></div>${apnStr}</div>`;
+
+  tooltip.innerHTML = html;
+  tooltip.style.display = 'block';
+
+  let tx = mx + 16;
+  let ty = my - 10;
+  const tw = tooltip.offsetWidth;
+  if (tx + tw > W - 8) tx = mx - tw - 16;
+  if (ty < 4) ty = 4;
+  tooltip.style.left = tx + 'px';
+  tooltip.style.top = ty + 'px';
+});
+
+chartArea.addEventListener('mouseleave', () => {
+  crosshair.style.display = 'none';
+  tooltip.style.display = 'none';
+});
+
+// ============================================================
+// Zoom & Pan
+// ============================================================
+const ZOOM_FACTOR = 0.8; // scroll-zoom sensitivity (smaller = zoom faster)
+const MIN_RANGE = 2;     // minimum visible range in minutes
+
+function updateZoomUI() {
+  const btn = document.getElementById('resetZoom');
+  const isZoomed = Math.abs(T_MIN - T_MIN_FULL) > 0.1 || Math.abs(T_MAX - T_MAX_FULL) > 0.1;
+  btn.style.display = isZoomed ? 'block' : 'none';
+  canvas.classList.toggle('zoomed', isZoomed);
+}
+
+function resetZoom() {
+  T_MIN = T_MIN_FULL;
+  T_MAX = T_MAX_FULL;
+  updateZoomUI();
+  draw();
+}
+
+// Wheel zoom: centered on cursor position
+chartArea.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  if (mx < MARGIN.left || mx > MARGIN.left + plotW) return;
+
+  const tCursor = xToT(mx);
+  const range = T_MAX - T_MIN;
+  const factor = e.deltaY > 0 ? 1 / ZOOM_FACTOR : ZOOM_FACTOR;
+  const newRange = Math.max(MIN_RANGE, Math.min(T_MAX_FULL - T_MIN_FULL, range * factor));
+
+  // Fraction of cursor within the current view
+  const frac = (tCursor - T_MIN) / range;
+  T_MIN = tCursor - frac * newRange;
+  T_MAX = tCursor + (1 - frac) * newRange;
+
+  // Clamp to full range
+  if (T_MIN < T_MIN_FULL) { T_MAX += T_MIN_FULL - T_MIN; T_MIN = T_MIN_FULL; }
+  if (T_MAX > T_MAX_FULL) { T_MIN -= T_MAX - T_MAX_FULL; T_MAX = T_MAX_FULL; }
+  T_MIN = Math.max(T_MIN, T_MIN_FULL);
+  T_MAX = Math.min(T_MAX, T_MAX_FULL);
+
+  updateZoomUI();
+  draw();
+}, {passive: false});
+
+// Click-drag pan
+let panState = null;
+chartArea.addEventListener('mousedown', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  if (mx < MARGIN.left || mx > MARGIN.left + plotW) return;
+  // Only pan when zoomed in
+  if (Math.abs(T_MAX - T_MIN - (T_MAX_FULL - T_MIN_FULL)) < 0.1) return;
+  panState = { startX: e.clientX, startTMin: T_MIN, startTMax: T_MAX };
+  canvas.classList.add('panning');
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!panState) return;
+  const dx = e.clientX - panState.startX;
+  const dtPerPx = (panState.startTMax - panState.startTMin) / plotW;
+  let shift = -dx * dtPerPx;
+
+  let newMin = panState.startTMin + shift;
+  let newMax = panState.startTMax + shift;
+  if (newMin < T_MIN_FULL) { newMax += T_MIN_FULL - newMin; newMin = T_MIN_FULL; }
+  if (newMax > T_MAX_FULL) { newMin -= newMax - T_MAX_FULL; newMax = T_MAX_FULL; }
+
+  T_MIN = Math.max(newMin, T_MIN_FULL);
+  T_MAX = Math.min(newMax, T_MAX_FULL);
+  updateZoomUI();
+  draw();
+});
+
+window.addEventListener('mouseup', () => {
+  if (panState) {
+    panState = null;
+    canvas.classList.remove('panning');
+  }
+});
+
+window.addEventListener('resize', () => {
+  computeLayout();
+  draw();
+});
+</script>
+</body>
+</html>"""
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python generate_sleep_dashboard.py <input_directory>")
+        sys.exit(1)
+
+    input_dir = sys.argv[1]
+    if not os.path.isdir(input_dir):
+        print(f"Error: '{input_dir}' is not a directory")
+        sys.exit(1)
+
+    # Find files
+    try:
+        files = find_input_files(input_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    print(f"Found input files:")
+    for key, path in files.items():
+        print(f"  {key}: {os.path.basename(path)}")
+
+    # Determine reference date from the SleepU filename or first timestamp
+    # Use the first SleepU timestamp to get the starting date
+    with open(files['sleepu'], newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        first_row = next(reader)
+        first_dt = parse_sleepu_time(first_row['Time'])
+    ref_date = first_dt.date()
+    print(f"  Reference date: {ref_date}")
+
+    # Read all data
+    sleepu = read_sleepu(files['sleepu'], ref_date)
+    rr = read_resp_rate(files['resp_rate'], ref_date)
+    apnea = read_apnea(files['apnea'], ref_date)
+    obstr = read_obstructions(files['obstruct'], ref_date)
+
+    # -> New: compute apnea counts for dashboard (seconds)
+    apnea_count_gt10 = sum(1 for a in apnea if a[1] > 10.0)
+    apnea_count_gt50 = sum(1 for a in apnea if a[1] > 50.0)
+
+    print(f"\nData loaded:")
+    print(f"  SleepU samples: {len(sleepu)} (after 8x downsample)")
+    print(f"  Resp rate epochs: {len(rr)}")
+    print(f"  Apnea events: {len(apnea)}")
+    print(f"  Obstructions: {len(obstr)}")
+    print(f"  Apneas >10s: {apnea_count_gt10}, >50s: {apnea_count_gt50}")
+
+    if not sleepu:
+        print("Error: no valid SleepU data found")
+        sys.exit(1)
+
+    # Compute time range
+    t_min, t_max = compute_time_range(sleepu, rr)
+
+    # Determine the end date for subtitle
+    first_t = min(p[0] for p in sleepu)
+    last_t = max(p[0] for p in sleepu)
+    start_dt = first_dt
+    end_minutes = last_t
+    end_h = int(end_minutes / 60) % 24
+    end_m = int(end_minutes % 60)
+    # If recording crosses midnight, end date is next day
+    end_date = ref_date
+    if last_t >= 1440:
+        end_date = ref_date + timedelta(days=1)
+
+    subtitle = (f"{ref_date.strftime('%Y-%m-%d')} {minutes_to_clock(first_t)} "
+                f"&rarr; {end_date.strftime('%Y-%m-%d')} {minutes_to_clock(last_t)} "
+                f"&nbsp;&middot;&nbsp; {format_duration(first_t, last_t)} recording")
+    # append apnea summary to subtitle for the dashboard
+    subtitle += f" &nbsp;&nbsp; • &nbsp;Apneas &gt;10s: {apnea_count_gt10}, &gt;50s: {apnea_count_gt50}"
+
+    title_date = ref_date.strftime('%Y-%m-%d')
+
+    # Build compact JSON
+    data = {
+        'sleepU': sleepu,
+        'rr': rr,
+        'apnea': apnea,
+        'obstr': obstr,
+    }
+    data_json = json.dumps(data, separators=(',', ':'))
+
+    # Generate HTML
+    html = HTML_TEMPLATE
+    html = html.replace('%%TITLE_DATE%%', title_date)
+    html = html.replace('%%SUBTITLE%%', subtitle)
+    html = html.replace('%%DATA_JSON%%', data_json)
+    html = html.replace('%%T_MIN%%', str(round(t_min, 1)))
+    html = html.replace('%%T_MAX%%', str(round(t_max, 1)))
+
+    # Write output
+    output_path = os.path.join(input_dir, "sleep_dashboard.html")
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+
+    print(f"\nDashboard written to: {output_path}")
+    print(f"  File size: {os.path.getsize(output_path):,} bytes")
+
+
+if __name__ == "__main__":
+    main()
