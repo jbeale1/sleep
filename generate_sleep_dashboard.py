@@ -22,6 +22,9 @@ import json
 import glob
 from datetime import datetime, timedelta
 
+VERSION = "1.0.1"
+BUILD_DATE = "2026-02-07"
+
 
 def find_input_files(input_dir):
     """Locate the four required CSV files. Returns dict of paths or raises."""
@@ -68,35 +71,50 @@ def dt_to_minutes(dt, ref_date):
 
 
 def read_sleepu(filepath, ref_date):
-    """Read SleepU CSV, downsample 8x. Returns list of [t, spo2, hr, motion]."""
-    data = []
+    """Read SleepU CSV at full resolution. Returns compact dict:
+       {t0: start_minutes, dt: interval_minutes, spo2: [...], hr: [...], mot: [...]}
+       Invalid samples ('--' or out-of-range) are stored as None."""
+    spo2, hr, mot = [], [], []
+    first_dt_obj = None
+    second_dt_obj = None
+    ref_midnight = datetime.combine(ref_date, datetime.min.time())
     with open(filepath, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
-            if i % 8 != 0:
-                continue
             try:
                 dt = parse_sleepu_time(row['Time'])
             except (ValueError, KeyError):
                 continue
 
-            t = dt_to_minutes(dt, ref_date)
+            if first_dt_obj is None:
+                first_dt_obj = dt
+            elif second_dt_obj is None:
+                second_dt_obj = dt
 
             o2 = row.get('Oxygen Level', '').strip()
             pulse = row.get('Pulse Rate', '').strip()
             motion = row.get('Motion', '').strip()
 
             if o2 == '--' or pulse == '--':
+                spo2.append(None); hr.append(None); mot.append(None)
                 continue
             o2v = int(o2)
             pv = int(pulse)
             mv = int(motion) if motion != '--' else 0
 
             if o2v < 70 or pv < 30:
+                spo2.append(None); hr.append(None); mot.append(None)
                 continue
 
-            data.append([t, o2v, pv, mv])
-    return data
+            spo2.append(o2v)
+            hr.append(pv)
+            mot.append(mv)
+
+    # Compute t0 and dt from raw datetimes (avoid rounding loss)
+    t0 = (first_dt_obj - ref_midnight).total_seconds() / 60.0
+    interval_sec = (second_dt_obj - first_dt_obj).total_seconds()
+    dt_min = interval_sec / 60.0
+    return {'t0': round(t0, 4), 'dt': round(dt_min, 6), 'spo2': spo2, 'hr': hr, 'mot': mot}
 
 
 def read_resp_rate(filepath, ref_date):
@@ -144,7 +162,10 @@ def read_obstructions(filepath, ref_date):
 
 def compute_time_range(sleepu, rr):
     """Return (t_min, t_max) with some padding, and formatted subtitle info."""
-    all_t = [p[0] for p in sleepu] + [p[0] for p in rr]
+    t0 = sleepu['t0']
+    n = len(sleepu['spo2'])
+    t_end = t0 + (n - 1) * sleepu['dt']
+    all_t = [t0, t_end] + [p[0] for p in rr]
     t_min = min(all_t)
     t_max = max(all_t)
     # Pad by 3 minutes on each side
@@ -301,10 +322,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     display: none;
   }
 
-  .theme-toggle {
+  .btn-bar {
     position: fixed;
     top: 12px;
     right: 16px;
+    display: flex;
+    gap: 8px;
+    z-index: 200;
+  }
+
+  .theme-toggle {
     background: #1a2430;
     border: 1px solid #2a3a4a;
     color: #8899aa;
@@ -313,9 +340,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 5px 12px;
     border-radius: 4px;
     cursor: pointer;
-    z-index: 200;
   }
   .theme-toggle:hover { background: #243040; color: #b0c0d0; }
+
+  .version-stamp {
+    position: fixed;
+    top: 38px;
+    right: 16px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px;
+    color: #2a3a4a;
+    z-index: 200;
+    text-align: right;
+  }
+  body.light-theme .version-stamp { color: #c0c0c0; }
 
   body.light-theme { background: #ffffff; color: #333; }
   body.light-theme h1 { color: #111; }
@@ -334,16 +372,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .subtitle { color: #555 !important; }
     .legend { background: #f5f5f5 !important; border-color: #ccc !important; }
     .legend-item { color: #555 !important; }
-    .theme-toggle { display: none !important; }
-    #resetZoom { display: none !important; }
+    .btn-bar { display: none !important; }
+    .version-stamp { display: none !important; }
     .tooltip-box, .crosshair { display: none !important; }
   }
 </style>
 </head>
 <body>
 
-<button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">&#x263C; Light</button>
-<button class="theme-toggle" id="resetZoom" style="right:100px; display:none;" onclick="resetZoom()">&#x21BA; Reset Zoom</button>
+<div class="btn-bar">
+  <button class="theme-toggle" id="resetZoom" style="display:none;" onclick="resetZoom()">&#x21BA; Reset Zoom</button>
+  <button class="theme-toggle" id="savePng" onclick="savePNG(2)">&#x1F4BE; Save PNG 2x</button>
+  <button class="theme-toggle" id="savePng1x" onclick="savePNG(1)">&#x1F4BE; Save PNG 1x</button>
+  <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">&#x263C; Light</button>
+</div>
+<div class="version-stamp" id="versionStamp">v%%VERSION%% &middot; %%BUILD_DATE%%</div>
 
 <h1>Overnight Sleep Study</h1>
 <div class="subtitle">%%SUBTITLE%%</div>
@@ -358,6 +401,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="legend-item"><div class="legend-swatch dot" id="lsw-omod" style="background:#f0a030"></div>Obstruction (mod)</div>
   <div class="legend-item"><div class="legend-swatch dot" id="lsw-osev" style="background:#ff4040"></div>Obstruction (sev)</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-mot" style="background:rgba(160,140,220,0.5)"></div>Motion</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-good" style="background:rgba(80,200,120,0.5); border-top: 2px dotted rgba(80,200,120,0.8); height:0; width:18px;"></div>Restful (&ge;15m)</div>
 </div>
 
 <div class="chart-container" id="chartArea">
@@ -381,6 +425,13 @@ let T_MAX = T_MAX_FULL;
 // ============================================================
 const THEMES = {
   dark: {
+    bodyBg: '#0a0e14',
+    titleText: '#e8ecf0',
+    subtitleText: '#6b7a8d',
+    legendBg: '#111822',
+    legendBorder: '#1e2a38',
+    legendText: '#8899aa',
+    versionText: '#2a3a4a',
     panelBg: '#0d1219',
     panelBorder: '#1a2430',
     gridLine: 'rgba(30,42,56,0.6)',
@@ -405,8 +456,16 @@ const THEMES = {
     apneaLong: 'rgba(255,220,40,0.8)',
     apneaLongText: '#ffe060',
     spo2DipText: '#ff6060',
+    goodSleep: 'rgba(80,200,120,0.5)',
   },
   light: {
+    bodyBg: '#ffffff',
+    titleText: '#111111',
+    subtitleText: '#555555',
+    legendBg: '#f0f0f0',
+    legendBorder: '#cccccc',
+    legendText: '#555555',
+    versionText: '#c0c0c0',
     panelBg: '#f8f8f8',
     panelBorder: '#cccccc',
     gridLine: 'rgba(0,0,0,0.12)',
@@ -431,6 +490,7 @@ const THEMES = {
     apneaLong: 'rgba(200,160,0,0.75)',
     apneaLongText: '#806000',
     spo2DipText: '#cc0000',
+    goodSleep: 'rgba(40,160,80,0.45)',
   }
 };
 let theme = THEMES.dark;
@@ -445,6 +505,9 @@ function updateLegendColors() {
   document.getElementById('lsw-omod').style.background = theme.obstrMod;
   document.getElementById('lsw-osev').style.background = theme.obstrSevere;
   document.getElementById('lsw-mot').style.background = theme.motionBar;
+  const goodEl = document.getElementById('lsw-good');
+  goodEl.style.background = 'none';
+  goodEl.style.borderTop = '2px dotted ' + theme.goodSleep;
 }
 
 function toggleTheme() {
@@ -712,9 +775,18 @@ function drawXAxis() {
 // ============================================================
 // Prepare data arrays
 // ============================================================
-const spo2Data  = RAW.sleepU.map(d => ({t: d[0], v: d[1]}));
-const hrData    = RAW.sleepU.map(d => ({t: d[0], v: d[2]}));
-const motData   = RAW.sleepU.map(d => ({t: d[0], v: d[3]}));
+// SleepU stored compactly: {t0, dt, spo2:[], hr:[], mot:[]}
+// Reconstruct time from index: t = t0 + i * dt
+const _su = RAW.sleepU;
+const spo2Data = [];
+const hrData   = [];
+const motData  = [];
+for (let i = 0; i < _su.spo2.length; i++) {
+  const t = _su.t0 + i * _su.dt;
+  if (_su.spo2[i] !== null) spo2Data.push({t, v: _su.spo2[i]});
+  if (_su.hr[i]   !== null) hrData.push({t, v: _su.hr[i]});
+  if (_su.mot[i]  !== null) motData.push({t, v: _su.mot[i]});
+}
 const rrData    = RAW.rr.map(d => ({t: d[0], v: d[1]}));
 const apneaData = RAW.apnea.map(d => ({t: d[0], dur: d[1]}));
 const obstrData = RAW.obstr.map(d => ({t: d[0], dur: d[1], sev: d[2]}));
@@ -740,7 +812,7 @@ const APNEA_MAX_DUR = apneaData.length > 0
   : 60;
 
 // Compute HR moving average (window ~5 minutes centered)
-const HR_MA_WINDOW = 75;  // samples each side (8x downsample, ~5 min half-window)
+const HR_MA_WINDOW = 75;  // samples each side (~5 min half-window at 4s interval)
 const hrMA = [];
 for (let i = 0; i < hrData.length; i++) {
   let lo = Math.max(0, i - HR_MA_WINDOW);
@@ -772,6 +844,89 @@ for (let i = 1; i < spo2Data.length - 1; i++) {
   spo2Dips.push({idx: i, t: spo2Data[i].t, v});
 }
 
+// Compute HR 15-minute moving average (for good-sleep detection)
+const HR_MA15_WINDOW = 112;  // samples each side (~7.5 min half-window → 15 min total at 4s)
+const hrMA15 = [];
+for (let i = 0; i < hrData.length; i++) {
+  let lo = Math.max(0, i - HR_MA15_WINDOW);
+  let hi = Math.min(hrData.length - 1, i + HR_MA15_WINDOW);
+  let sum = 0;
+  for (let j = lo; j <= hi; j++) sum += hrData[j].v;
+  hrMA15.push({t: hrData[i].t, v: sum / (hi - lo + 1)});
+}
+
+// ============================================================
+// Detect "good sleep" periods (≥20 min contiguous)
+//   1. No apnea events
+//   2. No obstructions (moderate or severe)
+//   3. SpO2 ≥ 96%
+//   4. 15-min HR MA non-increasing
+// ============================================================
+const GOOD_MIN_DURATION = 15; // minutes
+const HR_RISE_TOL = 1.0;     // bpm tolerance for "non-increasing"
+const HR_LOOKBACK = 30;      // samples (~2 min) for slope check
+
+// Build sorted event intervals for quick overlap checks
+const evtIntervals = [];
+for (const a of apneaData) evtIntervals.push({t0: a.t, t1: a.t + a.dur / 60});
+for (const o of obstrData) evtIntervals.push({t0: o.t, t1: o.t + o.dur / 60});
+evtIntervals.sort((a, b) => a.t0 - b.t0);
+
+// Scan at HR data resolution
+const goodMask = new Uint8Array(hrData.length); // 1 = good at this sample
+for (let i = 0; i < hrData.length; i++) {
+  const t = hrData[i].t;
+
+  // Check 1 & 2: no apnea or obstruction overlapping this time
+  let hasEvent = false;
+  for (const ev of evtIntervals) {
+    if (ev.t0 > t + 0.5) break; // events are sorted, no need to check further
+    if (ev.t1 >= t - 0.5) { hasEvent = true; break; }
+  }
+  if (hasEvent) continue;
+
+  // Check 3: SpO2 ≥ 96% (find nearest SpO2 sample)
+  // Binary-ish search: SpO2 data is same resolution as HR from same source
+  let spo2Ok = false;
+  for (let si = Math.max(0, i - 2); si <= Math.min(spo2Data.length - 1, i + 2); si++) {
+    if (Math.abs(spo2Data[si].t - t) < 0.2) {
+      if (spo2Data[si].v >= 96) spo2Ok = true;
+      break;
+    }
+  }
+  if (!spo2Ok) continue;
+
+  // Check 4: 15-min HR MA non-increasing (not rising >1 bpm vs 2 min ago)
+  if (i >= HR_LOOKBACK) {
+    if (hrMA15[i].v > hrMA15[i - HR_LOOKBACK].v + HR_RISE_TOL) continue;
+  }
+
+  goodMask[i] = 1;
+}
+
+// Extract contiguous runs ≥ GOOD_MIN_DURATION
+const goodPeriods = [];
+let runStart = -1;
+for (let i = 0; i <= hrData.length; i++) {
+  if (i < hrData.length && goodMask[i]) {
+    if (runStart < 0) runStart = i;
+  } else {
+    if (runStart >= 0) {
+      const tStart = hrData[runStart].t;
+      const tEnd = hrData[i - 1].t;
+      if (tEnd - tStart >= GOOD_MIN_DURATION) {
+        goodPeriods.push({t0: tStart, t1: tEnd});
+      }
+      runStart = -1;
+    }
+  }
+}
+
+// Append restful total to subtitle
+const restfulTotal = Math.round(goodPeriods.reduce((s, gp) => s + (gp.t1 - gp.t0), 0));
+document.querySelector('.subtitle').insertAdjacentHTML('beforeend',
+  ` \u00a0\u00a0\u2022 \u00a0Restful: ${restfulTotal}m`);
+
 // Generate tick arrays
 function makeTicks(lo, hi, step) {
   const ticks = [];
@@ -789,7 +944,8 @@ const motTicks = makeTicks(0, MOT_MAX, MOT_MAX > 30 ? Math.ceil(MOT_MAX / 3 / 5)
 // DRAW
 // ============================================================
 function draw() {
-  ctx.clearRect(0, 0, W, TOTAL_H);
+  ctx.fillStyle = theme.bodyBg;
+  ctx.fillRect(0, 0, W, TOTAL_H);
   for (let i = 0; i < 5; i++) drawPanelBg(i);
   drawXAxis();
 
@@ -828,6 +984,22 @@ function draw() {
   const EVT_TOP = panelTop(3);
   const EVT_H = PANEL_HEIGHTS[3];
   drawYAxis(0, APNEA_MAX_DUR, 3, apneaTicks, 'Apnea (s)', theme.evtLabel);
+
+  // Draw good-sleep indicators (green dotted line at panel midpoint)
+  const goodY = EVT_TOP + EVT_H * 0.5;
+  ctx.strokeStyle = theme.goodSleep;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 4]);
+  for (const gp of goodPeriods) {
+    const x0 = Math.max(tToX(gp.t0), MARGIN.left);
+    const x1 = Math.min(tToX(gp.t1), MARGIN.left + plotW);
+    if (x1 <= x0) continue;
+    ctx.beginPath();
+    ctx.moveTo(x0, goodY);
+    ctx.lineTo(x1, goodY);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
 
   // Draw all apnea bars first (clipped to plot area)
   const apneaBars = [];
@@ -1155,6 +1327,172 @@ window.addEventListener('mouseup', () => {
   }
 });
 
+// ============================================================
+// Save PNG at specified resolution with header
+// ============================================================
+function savePNG(exportScale) {
+  const EXPORT_SCALE = exportScale || 2;
+  const isLight = document.body.classList.contains('light-theme');
+
+  // --- Measure header content from DOM ---
+  const titleText = document.querySelector('h1').textContent;
+  const subtitleText = document.querySelector('.subtitle').textContent;
+  const legendItems = [];
+  document.querySelectorAll('.legend-item').forEach(item => {
+    const swatch = item.querySelector('.legend-swatch');
+    const cs = getComputedStyle(swatch);
+    legendItems.push({
+      color: cs.backgroundColor,
+      borderColor: cs.borderTopColor,
+      isDot: swatch.classList.contains('dot'),
+      isBar: swatch.classList.contains('bar'),
+      text: item.textContent.trim()
+    });
+  });
+
+  // --- Header layout constants ---
+  const PAD_TOP = 12;
+  const TITLE_H = 24;
+  const GAP1 = 4;
+  const SUB_H = 16;
+  const GAP2 = 8;
+  const LEG_PAD = 8;
+  const LEG_ROW_H = 16;
+  const LEG_BOT = 8;
+
+  // Pre-measure legend to determine if it wraps
+  const tmpC = document.createElement('canvas');
+  const tmpX = tmpC.getContext('2d');
+  tmpX.font = '12px IBM Plex Mono';
+  const LEG_ITEM_GAP = 20;
+  const LEG_SWATCH_W = 20;
+  const maxLegW = W - 32;
+  let rows = [[]];
+  let rowW = 0;
+  for (const item of legendItems) {
+    const iw = LEG_SWATCH_W + tmpX.measureText(item.text).width + LEG_ITEM_GAP;
+    if (rowW > 0 && rowW + iw > maxLegW) {
+      rows.push([]);
+      rowW = 0;
+    }
+    rows[rows.length - 1].push(item);
+    rowW += iw;
+  }
+  const legendBoxH = LEG_PAD + rows.length * LEG_ROW_H + LEG_BOT;
+  const headerH = PAD_TOP + TITLE_H + GAP1 + SUB_H + GAP2 + legendBoxH + 8;
+
+  // --- Create offscreen canvas ---
+  const totalH = headerH + TOTAL_H;
+  const off = document.createElement('canvas');
+  off.width = W * EXPORT_SCALE;
+  off.height = totalH * EXPORT_SCALE;
+  const oc = off.getContext('2d');
+  oc.setTransform(EXPORT_SCALE, 0, 0, EXPORT_SCALE, 0, 0);
+
+  // Background
+  oc.fillStyle = theme.bodyBg;
+  oc.fillRect(0, 0, W, totalH);
+
+  // Title
+  let y = PAD_TOP;
+  oc.font = '600 20px IBM Plex Sans, sans-serif';
+  oc.fillStyle = theme.titleText;
+  oc.textAlign = 'left';
+  oc.textBaseline = 'top';
+  oc.fillText(titleText, 0, y);
+
+  // Version stamp (top-right, subtle)
+  const versionText = document.getElementById('versionStamp').textContent;
+  oc.font = '9px IBM Plex Mono, monospace';
+  oc.fillStyle = theme.versionText;
+  oc.textAlign = 'right';
+  oc.textBaseline = 'top';
+  oc.fillText(versionText, W, y + 4);
+  oc.textAlign = 'left';
+
+  y += TITLE_H + GAP1;
+
+  // Subtitle
+  oc.font = '13px IBM Plex Mono, monospace';
+  oc.fillStyle = theme.subtitleText;
+  oc.fillText(subtitleText, 0, y);
+  y += SUB_H + GAP2;
+
+  // Legend box
+  oc.fillStyle = theme.legendBg;
+  oc.strokeStyle = theme.legendBorder;
+  oc.lineWidth = 1;
+  const legBoxY = y;
+  oc.beginPath();
+  oc.roundRect(16, legBoxY, W - 32, legendBoxH, 6);
+  oc.fill();
+  oc.stroke();
+
+  // Legend items
+  oc.font = '12px IBM Plex Mono, monospace';
+  let ly = legBoxY + LEG_PAD;
+  for (const row of rows) {
+    let lx = 32;
+    for (const item of row) {
+      // Swatch
+      oc.fillStyle = item.color;
+      if (item.isDot) {
+        oc.beginPath();
+        oc.arc(lx + 4, ly + 6, 4, 0, Math.PI * 2);
+        oc.fill();
+      } else if (item.isBar) {
+        oc.fillRect(lx, ly + 1, 14, 10);
+      } else {
+        // Check if this is the "Restful" item (dotted line style)
+        if (item.text.includes('Restful')) {
+          oc.strokeStyle = item.borderColor || item.color;
+          oc.lineWidth = 2;
+          oc.setLineDash([6, 4]);
+          oc.beginPath();
+          oc.moveTo(lx, ly + 6);
+          oc.lineTo(lx + 14, ly + 6);
+          oc.stroke();
+          oc.setLineDash([]);
+        } else {
+          // Regular solid line
+          oc.fillRect(lx, ly + 4, 14, 4);
+        }
+      }
+      lx += LEG_SWATCH_W;
+      // Label
+      oc.fillStyle = theme.legendText;
+      oc.textAlign = 'left';
+      oc.textBaseline = 'top';
+      oc.fillText(item.text, lx, ly);
+      lx += oc.measureText(item.text).width + LEG_ITEM_GAP;
+    }
+    ly += LEG_ROW_H;
+  }
+
+  // --- Render chart at export scale, then composite ---
+  canvas.width = W * EXPORT_SCALE;
+  canvas.height = TOTAL_H * EXPORT_SCALE;
+  ctx.setTransform(EXPORT_SCALE, 0, 0, EXPORT_SCALE, 0, 0);
+  draw();
+
+  oc.setTransform(1, 0, 0, 1, 0, 0);
+  oc.drawImage(canvas, 0, headerH * EXPORT_SCALE,
+               W * EXPORT_SCALE, TOTAL_H * EXPORT_SCALE);
+
+  // --- Download ---
+  const link = document.createElement('a');
+  link.download = `sleep_dashboard_%%TITLE_DATE%%_${EXPORT_SCALE}x.png`;
+  link.href = off.toDataURL('image/png');
+  link.click();
+
+  // --- Restore main canvas ---
+  canvas.width = W * DPR;
+  canvas.height = TOTAL_H * DPR;
+  canvas.style.height = TOTAL_H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  draw();
+}
+
 window.addEventListener('resize', () => {
   computeLayout();
   draw();
@@ -1205,13 +1543,13 @@ def main():
     apnea_count_gt50 = sum(1 for a in apnea if a[1] > 50.0)
 
     print(f"\nData loaded:")
-    print(f"  SleepU samples: {len(sleepu)} (after 8x downsample)")
+    print(f"  SleepU samples: {len(sleepu['spo2'])} (full resolution, interval={sleepu['dt']*60:.1f}s)")
     print(f"  Resp rate epochs: {len(rr)}")
     print(f"  Apnea events: {len(apnea)}")
     print(f"  Obstructions: {len(obstr)}")
     print(f"  Apneas >10s: {apnea_count_gt10}, >50s: {apnea_count_gt50}")
 
-    if not sleepu:
+    if not sleepu['spo2']:
         print("Error: no valid SleepU data found")
         sys.exit(1)
 
@@ -1219,8 +1557,8 @@ def main():
     t_min, t_max = compute_time_range(sleepu, rr)
 
     # Determine the end date for subtitle
-    first_t = min(p[0] for p in sleepu)
-    last_t = max(p[0] for p in sleepu)
+    first_t = sleepu['t0']
+    last_t = sleepu['t0'] + (len(sleepu['spo2']) - 1) * sleepu['dt']
     start_dt = first_dt
     end_minutes = last_t
     end_h = int(end_minutes / 60) % 24
@@ -1254,6 +1592,8 @@ def main():
     html = html.replace('%%DATA_JSON%%', data_json)
     html = html.replace('%%T_MIN%%', str(round(t_min, 1)))
     html = html.replace('%%T_MAX%%', str(round(t_max, 1)))
+    html = html.replace('%%VERSION%%', VERSION)
+    html = html.replace('%%BUILD_DATE%%', BUILD_DATE)
 
     # Write output
     output_path = os.path.join(input_dir, "sleep_dashboard.html")
