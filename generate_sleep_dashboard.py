@@ -22,7 +22,7 @@ import json
 import glob
 from datetime import datetime, timedelta
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 BUILD_DATE = "2026-02-07"
 
 
@@ -344,14 +344,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .theme-toggle:hover { background: #243040; color: #b0c0d0; }
 
   .version-stamp {
-    position: fixed;
-    top: 38px;
-    right: 16px;
+    display: inline;
+    margin-left: 12px;
     font-family: 'IBM Plex Mono', monospace;
     font-size: 9px;
     color: #2a3a4a;
-    z-index: 200;
-    text-align: right;
+    vertical-align: middle;
   }
   body.light-theme .version-stamp { color: #c0c0c0; }
 
@@ -386,9 +384,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <button class="theme-toggle" id="savePng1x" onclick="savePNG(1)">&#x1F4BE; Save PNG 1x</button>
   <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">&#x263C; Light</button>
 </div>
-<div class="version-stamp" id="versionStamp">v%%VERSION%% &middot; %%BUILD_DATE%%</div>
-
-<h1>Overnight Sleep Study</h1>
+<h1>Overnight Sleep Study <span class="version-stamp" id="versionStamp">v%%VERSION%% &middot; %%BUILD_DATE%%</span></h1>
 <div class="subtitle">%%SUBTITLE%%</div>
 
 <div class="legend" id="legendBar">
@@ -1401,14 +1397,14 @@ function savePNG(exportScale) {
   oc.textBaseline = 'top';
   oc.fillText(titleText, 0, y);
 
-  // Version stamp (top-right, subtle)
+  // Version stamp (inline after title, subtle)
   const versionText = document.getElementById('versionStamp').textContent;
+  const titleWidth = oc.measureText(titleText).width;
   oc.font = '9px IBM Plex Mono, monospace';
   oc.fillStyle = theme.versionText;
-  oc.textAlign = 'right';
-  oc.textBaseline = 'top';
-  oc.fillText(versionText, W, y + 4);
   oc.textAlign = 'left';
+  oc.textBaseline = 'top';
+  oc.fillText(versionText, titleWidth + 12, y + 6);
 
   y += TITLE_H + GAP1;
 
@@ -1542,12 +1538,61 @@ def main():
     apnea_count_gt10 = sum(1 for a in apnea if a[1] > 10.0)
     apnea_count_gt50 = sum(1 for a in apnea if a[1] > 50.0)
 
+    # Compute SpO2-derived metrics
+    spo2_valid = [v for v in sleepu['spo2'] if v is not None]
+    interval_min = sleepu['dt']  # minutes per sample
+
+    # Time with SpO2 < 90%
+    samples_below_90 = sum(1 for v in spo2_valid if v < 90)
+    time_below_90_min = round(samples_below_90 * interval_min, 1)
+
+    # ODI (Oxygen Desaturation Index): >=3% drops per hour of valid recording
+    # Uses adaptive baseline: highest SpO2 in trailing window, count events
+    # where SpO2 drops >=3% below that baseline
+    def compute_odi(spo2_series, interval_minutes, desat_threshold=3,
+                    baseline_window_min=2.0, min_event_gap_min=0.5):
+        """Count >=desat_threshold% desaturation events per hour."""
+        window_samples = max(1, int(baseline_window_min / interval_minutes))
+        gap_samples = max(1, int(min_event_gap_min / interval_minutes))
+        events = 0
+        in_desat = False
+        cooldown = 0
+        valid_count = 0
+        for i, v in enumerate(spo2_series):
+            if v is None:
+                continue
+            valid_count += 1
+            # Compute baseline from recent valid samples in trailing window
+            start = max(0, i - window_samples)
+            baseline_vals = [s for s in spo2_series[start:i+1] if s is not None]
+            if not baseline_vals:
+                continue
+            baseline = max(baseline_vals)
+            if cooldown > 0:
+                cooldown -= 1
+                if v >= baseline - 1:  # recovered
+                    in_desat = False
+                continue
+            if not in_desat and baseline - v >= desat_threshold:
+                events += 1
+                in_desat = True
+                cooldown = gap_samples
+            elif in_desat and v >= baseline - 1:
+                in_desat = False
+        valid_hours = (valid_count * interval_minutes) / 60.0
+        return round(events / valid_hours, 1) if valid_hours > 0 else 0.0
+
+    odi_3pct = compute_odi(sleepu['spo2'], interval_min, desat_threshold=3)
+    odi_4pct = compute_odi(sleepu['spo2'], interval_min, desat_threshold=4)
+
     print(f"\nData loaded:")
     print(f"  SleepU samples: {len(sleepu['spo2'])} (full resolution, interval={sleepu['dt']*60:.1f}s)")
     print(f"  Resp rate epochs: {len(rr)}")
     print(f"  Apnea events: {len(apnea)}")
     print(f"  Obstructions: {len(obstr)}")
     print(f"  Apneas >10s: {apnea_count_gt10}, >50s: {apnea_count_gt50}")
+    print(f"  ODI (≥3%): {odi_3pct}/hr, ODI (≥4%): {odi_4pct}/hr")
+    print(f"  Time SpO2 <90%: {time_below_90_min} min")
 
     if not sleepu['spo2']:
         print("Error: no valid SleepU data found")
@@ -1573,6 +1618,8 @@ def main():
                 f"&nbsp;&middot;&nbsp; {format_duration(first_t, last_t)} recording")
     # append apnea summary to subtitle for the dashboard
     subtitle += f" &nbsp;&nbsp; • &nbsp;Apneas &gt;10s: {apnea_count_gt10}, &gt;50s: {apnea_count_gt50}"
+    subtitle += f" &nbsp;&nbsp; • &nbsp;ODI(3%): {odi_3pct}/hr, ODI(4%): {odi_4pct}/hr"
+    subtitle += f" &nbsp;&nbsp; • &nbsp;SpO\u2082&lt;90%: {time_below_90_min}m"
 
     title_date = ref_date.strftime('%Y-%m-%d')
 

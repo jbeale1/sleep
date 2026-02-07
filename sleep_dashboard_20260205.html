@@ -151,14 +151,12 @@
   .theme-toggle:hover { background: #243040; color: #b0c0d0; }
 
   .version-stamp {
-    position: fixed;
-    top: 38px;
-    right: 16px;
+    display: inline;
+    margin-left: 12px;
     font-family: 'IBM Plex Mono', monospace;
     font-size: 9px;
     color: #2a3a4a;
-    z-index: 200;
-    text-align: right;
+    vertical-align: middle;
   }
   body.light-theme .version-stamp { color: #c0c0c0; }
 
@@ -193,10 +191,8 @@
   <button class="theme-toggle" id="savePng1x" onclick="savePNG(1)">&#x1F4BE; Save PNG 1x</button>
   <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">&#x263C; Light</button>
 </div>
-<div class="version-stamp" id="versionStamp">v1.0.0 &middot; 2026-02-06</div>
-
-<h1>Overnight Sleep Study</h1>
-<div class="subtitle">2026-02-05 22:56 &rarr; 2026-02-06 06:59 &nbsp;&middot;&nbsp; ~8h 02m recording &nbsp;&nbsp; • &nbsp;Apneas &gt;10s: 152, &gt;50s: 0</div>
+<h1>Overnight Sleep Study <span class="version-stamp" id="versionStamp">v1.1.0 &middot; 2026-02-07</span></h1>
+<div class="subtitle">2026-02-05 22:56 &rarr; 2026-02-06 06:59 &nbsp;&middot;&nbsp; ~8h 02m recording &nbsp;&nbsp; • &nbsp;Apneas &gt;10s: 152, &gt;50s: 0 &nbsp;&nbsp; • &nbsp;ODI(3%): 27.6/hr, ODI(4%): 19.3/hr &nbsp;&nbsp; • &nbsp;SpO₂&lt;90%: 2.3m</div>
 
 <div class="legend" id="legendBar">
   <div class="legend-item"><div class="legend-swatch" id="lsw-spo2" style="background:#48b8e8"></div>SpO&#x2082; (%)</div>
@@ -1208,14 +1204,14 @@ function savePNG(exportScale) {
   oc.textBaseline = 'top';
   oc.fillText(titleText, 0, y);
 
-  // Version stamp (top-right, subtle)
+  // Version stamp (inline after title, subtle)
   const versionText = document.getElementById('versionStamp').textContent;
+  const titleWidth = oc.measureText(titleText).width;
   oc.font = '9px IBM Plex Mono, monospace';
   oc.fillStyle = theme.versionText;
-  oc.textAlign = 'right';
-  oc.textBaseline = 'top';
-  oc.fillText(versionText, W, y + 4);
   oc.textAlign = 'left';
+  oc.textBaseline = 'top';
+  oc.fillText(versionText, titleWidth + 12, y + 6);
 
   y += TITLE_H + GAP1;
 
