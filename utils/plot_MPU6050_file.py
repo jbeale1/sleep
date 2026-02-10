@@ -10,6 +10,7 @@ J.Beale 2026-02-09
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 from scipy.signal import butter, sosfiltfilt, find_peaks
 
 # --- Configuration ---
@@ -91,9 +92,24 @@ def load_and_plot(csv_path, save_path=None):
 
     fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
     fig.suptitle(title, fontsize=13)
-    fig.subplots_adjust(hspace=0.30)
+    fig.subplots_adjust(hspace=0.30, bottom=0.08)
 
     ax1, ax2, ax3, ax4 = axes
+
+    # track titles for both modes
+    titles_symlog = [
+        f"Body Angle (symlog, linear < {LINTHRESH_ANGLE}°)",
+        f"Breathing — pitch BP {BREATH_LO}–{BREATH_HI} Hz (symlog, linear < {LINTHRESH_BREATH}°)",
+        f"Cardiac — RMS BP {CARDIAC_LO}–{CARDIAC_HI} Hz (symlog, linear < {LINTHRESH_CARDIAC} mG)",
+        f"Raw Motion (symlog, linear < {LINTHRESH_MOTION} mG)",
+    ]
+    titles_linear = [
+        "Body Angle (linear)",
+        f"Breathing — pitch BP {BREATH_LO}–{BREATH_HI} Hz (linear)",
+        f"Cardiac — RMS BP {CARDIAC_LO}–{CARDIAC_HI} Hz (linear)",
+        "Raw Motion (linear)",
+    ]
+    linthresh_vals = [LINTHRESH_ANGLE, LINTHRESH_BREATH, LINTHRESH_CARDIAC, LINTHRESH_MOTION]
 
     # 1: Body angle
     ax1.plot(t_plot, pitch, 'b-', linewidth=0.6, alpha=0.8, label='Pitch')
@@ -218,6 +234,33 @@ def load_and_plot(csv_path, save_path=None):
 
     # trigger initial computation
     on_xlim_changed(ax2)
+
+    # --- Symlog / Linear toggle button ---
+    is_symlog = [True]  # mutable so callback can modify
+
+    btn_ax = fig.add_axes([0.005, 0.01, 0.12, 0.035])
+    btn = Button(btn_ax, 'Scale: symlog', color='lightgoldenrodyellow', hovercolor='khaki')
+
+    def toggle_scale(event):
+        is_symlog[0] = not is_symlog[0]
+        if is_symlog[0]:
+            for ax, lt, t_s in zip(axes, linthresh_vals, titles_symlog):
+                ax.set_yscale('symlog', linthresh=lt)
+                ax.set_title(t_s, fontsize=10)
+                ax.grid(True, alpha=0.3, which='both')
+            btn.label.set_text('Scale: symlog')
+        else:
+            for ax, t_l in zip(axes, titles_linear):
+                ax.set_yscale('linear')
+                ax.set_title(t_l, fontsize=10)
+                ax.grid(True, alpha=0.3)
+            # auto-rescale y axes to visible data
+            for ax in axes:
+                ax.relim()
+                ax.autoscale_view(scalex=False, scaley=True)
+        fig.canvas.draw_idle()
+
+    btn.on_clicked(toggle_scale)
 
     if use_clock:
         class AdaptiveTimeFormatter(plt.Formatter):

@@ -152,12 +152,12 @@ def compute_multiband_envelope(audio, sr):
     Returns (times, envelope) where envelope values represent SNR relative
     to the noise floor (1.0 = at noise floor).
     """
-    # Click/pop removal on raw audio before any filtering.
-    # Median filter removes impulsive transients (<20ms) while preserving
-    # breathing events (>500ms).  Must be applied before bandpass so clicks
-    # can't spread energy across frequency bands.
-    click_kernel = int(sr * MULTIBAND_CLICK_FILTER_MS / 1000) | 1  # must be odd
-    audio_clean = signal.medfilt(audio, kernel_size=click_kernel)
+    # Click/pop rejection is handled downstream by the RMS windowing (100ms),
+    # peak minimum-width constraint, and peak distance requirements.
+    # A median filter was previously applied here but it destroys quiet
+    # broadband breathing (preserving only 2-11% of band energy at 24kHz)
+    # because the breathing is spectrally white and the 20ms kernel acts as
+    # an aggressive low-pass filter on the higher detection bands.
     
     band_envs = []
     t_out = None
@@ -165,7 +165,7 @@ def compute_multiband_envelope(audio, sr):
     for f_low, f_high in MULTIBAND_FREQ_BANDS:
         # Bandpass filter
         sos = signal.butter(4, [f_low, f_high], btype='band', fs=sr, output='sos')
-        filtered = signal.sosfilt(sos, audio_clean)
+        filtered = signal.sosfilt(sos, audio)
         
         # Compute RMS envelope
         window_samples = int(sr * MULTIBAND_ENV_WINDOW_MS / 1000)
