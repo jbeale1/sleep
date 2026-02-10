@@ -156,6 +156,11 @@ def load_and_plot(csv_path, save_path=None):
                             ha='right', va='top',
                             bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.85))
 
+    span_text = ax1.text(0.98, 0.95, '', transform=ax1.transAxes,
+                         fontsize=9, fontfamily='monospace',
+                         ha='right', va='top',
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.85))
+
     def get_visible_seconds():
         """Return (t_start, t_end) in seconds-from-start for current x-axis view."""
         xlim = ax2.get_xlim()
@@ -201,9 +206,19 @@ def load_and_plot(csv_path, save_path=None):
         except Exception:
             breath_text.set_text('')
             cardiac_text.set_text('')
+            span_text.set_text('')
             return
 
         span_min = (s1 - s0) / 60.0
+
+        # update displayed time span
+        span_sec = max(0, s1 - s0)
+        h = int(span_sec // 3600)
+        m = int((span_sec % 3600) // 60)
+        s = int(span_sec % 60)
+        span_text.set_text(f'Span {h:d}:{m:02d}:{s:02d}')
+
+        autoscale_y_to_visible()
 
         if span_min > 5.0:
             breath_text.set_text('')
@@ -232,14 +247,39 @@ def load_and_plot(csv_path, save_path=None):
     # connect to all shared x-axes (only need one, they're linked)
     ax2.callbacks.connect('xlim_changed', on_xlim_changed)
 
-    # trigger initial computation
-    on_xlim_changed(ax2)
-
     # --- Symlog / Linear toggle button ---
     is_symlog = [True]  # mutable so callback can modify
 
-    btn_ax = fig.add_axes([0.005, 0.01, 0.12, 0.035])
-    btn = Button(btn_ax, 'Scale: symlog', color='lightgoldenrodyellow', hovercolor='khaki')
+    def autoscale_y_to_visible():
+        """In linear mode, rescale Y axes to fit only the visible data."""
+        if is_symlog[0]:
+            return
+        try:
+            s0, s1 = get_visible_seconds()
+        except Exception:
+            return
+        mask = (t >= s0) & (t <= s1)
+        if not mask.any():
+            return
+        ax_data = [
+            [pitch[mask], roll[mask]],
+            [breath_filt[mask]],
+            [cardiac_filt[mask]],
+            [total[mask], rms[mask]],
+        ]
+        for ax, datasets in zip(axes, ax_data):
+            if not ax.get_visible():
+                continue
+            all_visible = np.concatenate(datasets)
+            ymin, ymax = np.nanmin(all_visible), np.nanmax(all_visible)
+            margin = (ymax - ymin) * 0.05
+            if margin == 0:
+                margin = 0.1
+            ax.set_ylim(ymin - margin, ymax + margin)
+
+    btn_ax = fig.add_axes([0.92, 0.96, 0.07, 0.03])
+    btn = Button(btn_ax, 'Y: symlog', color='lightgoldenrodyellow', hovercolor='khaki')
+    btn.label.set_fontsize(8)
 
     def toggle_scale(event):
         is_symlog[0] = not is_symlog[0]
@@ -248,19 +288,46 @@ def load_and_plot(csv_path, save_path=None):
                 ax.set_yscale('symlog', linthresh=lt)
                 ax.set_title(t_s, fontsize=10)
                 ax.grid(True, alpha=0.3, which='both')
-            btn.label.set_text('Scale: symlog')
+            btn.label.set_text('Y: symlog')
         else:
             for ax, t_l in zip(axes, titles_linear):
                 ax.set_yscale('linear')
                 ax.set_title(t_l, fontsize=10)
                 ax.grid(True, alpha=0.3)
-            # auto-rescale y axes to visible data
-            for ax in axes:
-                ax.relim()
-                ax.autoscale_view(scalex=False, scaley=True)
+            autoscale_y_to_visible()
+            btn.label.set_text('Y: linear')
         fig.canvas.draw_idle()
 
     btn.on_clicked(toggle_scale)
+
+    # --- Raw Motion panel toggle button ---
+    show_raw = [True]
+    btn2_ax = fig.add_axes([0.82, 0.96, 0.09, 0.03])
+    btn2 = Button(btn2_ax, 'Raw: on', color='lightgoldenrodyellow', hovercolor='khaki')
+    btn2.label.set_fontsize(8)
+
+    def toggle_raw(event):
+        show_raw[0] = not show_raw[0]
+        if show_raw[0]:
+            ax4.set_visible(True)
+            ax3.set_xlabel('')
+            ax3.tick_params(labelbottom=False)
+            ax4.set_xlabel(t_label)
+            fig.subplots_adjust(hspace=0.30, bottom=0.08)
+            btn2.label.set_text('Raw: on')
+        else:
+            ax4.set_visible(False)
+            ax4.set_xlabel('')
+            ax3.set_xlabel(t_label)
+            ax3.tick_params(labelbottom=True)
+            fig.subplots_adjust(hspace=0.30, bottom=0.08)
+            btn2.label.set_text('Raw: off')
+        fig.canvas.draw_idle()
+
+    btn2.on_clicked(toggle_raw)
+
+    # trigger initial computation (must be after autoscale_y_to_visible is defined)
+    on_xlim_changed(ax2)
 
     if use_clock:
         class AdaptiveTimeFormatter(plt.Formatter):

@@ -22,8 +22,8 @@ import json
 import glob
 from datetime import datetime, timedelta
 
-VERSION = "1.2.0"
-BUILD_DATE = "2026-02-08"
+VERSION = "1.3.0"
+BUILD_DATE = "2026-02-10"
 
 
 def find_input_files(input_dir):
@@ -540,6 +540,7 @@ const THEMES = {
     apneaLongText: '#ffe060',
     spo2DipText: '#ff6060',
     goodSleep: 'rgba(80,200,120,0.5)',
+    ahiHourlyText: 'rgba(255,255,255,0.85)',
   },
   light: {
     bodyBg: '#ffffff',
@@ -574,6 +575,7 @@ const THEMES = {
     apneaLongText: '#806000',
     spo2DipText: '#cc0000',
     goodSleep: 'rgba(40,160,80,0.45)',
+    ahiHourlyText: 'rgba(0,0,0,0.8)',
   }
 };
 let theme = THEMES.dark;
@@ -767,7 +769,7 @@ function drawYAxis(vMin, vMax, panelIdx, ticks, unit, color) {
   ctx.translate(14, panelTop(panelIdx) + PANEL_HEIGHTS[panelIdx]/2);
   ctx.rotate(-Math.PI/2);
   ctx.textAlign = 'center';
-  ctx.font = '500 10px IBM Plex Mono';
+  ctx.font = '500 13px IBM Plex Mono';
   ctx.fillStyle = color;
   ctx.fillText(unit, 0, 0);
   ctx.restore();
@@ -1233,6 +1235,32 @@ function draw() {
         ctx.fillText(label, fx, fy);
         placedLabels.push({x: fx, y: fy, w: lw, h: LABEL_H});
       }
+    }
+  }
+
+  // --- Hourly apnea count labels at bottom of panel ---
+  {
+    // Compute apnea counts per clock hour
+    const ahiByHour = {};
+    for (const a of apneaData) {
+      // a.t is minutes since midnight of ref_date
+      const hourKey = Math.floor(a.t / 60);
+      ahiByHour[hourKey] = (ahiByHour[hourKey] || 0) + 1;
+    }
+    ctx.font = 'bold 12px IBM Plex Mono';
+    ctx.fillStyle = theme.ahiHourlyText;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    const labelY = EVT_TOP + EVT_H - 4;
+    // Iterate visible whole hours
+    const firstHour = Math.ceil(T_MIN / 60);
+    const lastHour = Math.floor(T_MAX / 60);
+    for (let h = firstHour; h <= lastHour; h++) {
+      const count = ahiByHour[h] || 0;
+      const hourMidT = h * 60 + 30; // center of the hour
+      const x = tToX(hourMidT);
+      if (x < plotLeft || x > plotRight) continue;
+      ctx.fillText(String(count), x, labelY);
     }
   }
 
