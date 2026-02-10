@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32-C3 BLE Monitor</title>
+    <style>
+        body { font-family: sans-serif; max-width: 500px; margin: 40px auto; text-align: center; }
+        button { font-size: 18px; padding: 12px 24px; cursor: pointer; }
+        #status { margin: 20px 0; color: #666; }
+        #value { font-size: 72px; font-weight: bold; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <h2>ESP32-C3 BLE Monitor</h2>
+    <button id="connectBtn">Connect</button>
+    <div id="status">Click Connect to start</div>
+    <div id="value">--</div>
+
+    <script>
+        const BATTERY_SERVICE = 0x180F;
+        const BATTERY_LEVEL = 0x2A19;
+
+        document.getElementById('connectBtn').addEventListener('click', async () => {
+            const status = document.getElementById('status');
+            const valueDiv = document.getElementById('value');
+
+            try {
+                status.textContent = 'Requesting device...';
+				
+				const device = await navigator.bluetooth.requestDevice({
+					acceptAllDevices: true,
+					optionalServices: [BATTERY_SERVICE]
+				});
+				
+				status.textContent = 'Connecting...';
+				const server = await device.gatt.connect();
+
+				// Give GATT service discovery a moment
+				await new Promise(resolve => setTimeout(resolve, 1000));
+
+				status.textContent = 'Getting service...';
+				const service = await server.getPrimaryService('battery_service');
+				const characteristic = await service.getCharacteristic('battery_level');
+				
+                // Read initial value
+                const initial = await characteristic.readValue();
+                valueDiv.textContent = initial.getUint8(0) + '%';
+
+                // Subscribe to notifications
+                await characteristic.startNotifications();
+                characteristic.addEventListener('characteristicvaluechanged', (event) => {
+                    const level = event.target.value.getUint8(0);
+                    valueDiv.textContent = level + '%';
+                });
+
+                status.textContent = 'Connected to ' + device.name;
+
+                device.addEventListener('gattserverdisconnected', () => {
+                    status.textContent = 'Disconnected';
+                    valueDiv.textContent = '--';
+                });
+
+            } catch (err) {
+                status.textContent = 'Error: ' + err.message;
+            }
+        });
+    </script>
+</body>
+</html>

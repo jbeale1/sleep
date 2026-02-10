@@ -22,22 +22,37 @@ import json
 import glob
 from datetime import datetime, timedelta
 
-VERSION = "1.1.0"
-BUILD_DATE = "2026-02-07"
+VERSION = "1.2.0"
+BUILD_DATE = "2026-02-08"
 
 
 def find_input_files(input_dir):
-    """Locate the four required CSV files. Returns dict of paths or raises."""
+    """Locate the required CSV files. Returns dict of paths or raises.
+    Prefers Checkme O2 Ultra over SleepU for SpO2/HR/Motion if available."""
     files = {}
 
-    # SleepU file (wildcard date)
-    pattern = os.path.join(input_dir, "SleepU 6294_*.csv")
-    matches = sorted(glob.glob(pattern))
-    if not matches:
-        raise FileNotFoundError(f"No file matching 'SleepU 6294_*.csv' in {input_dir}")
-    if len(matches) > 1:
-        print(f"  Note: found {len(matches)} SleepU files, using {os.path.basename(matches[-1])}")
-    files['sleepu'] = matches[-1]
+    # Prefer Checkme O2 Ultra file if available, fall back to SleepU
+    checkme_pattern = os.path.join(input_dir, "Checkme O2 Ultra 2355_*.csv")
+    checkme_matches = sorted(glob.glob(checkme_pattern))
+
+    sleepu_pattern = os.path.join(input_dir, "SleepU 6294_*.csv")
+    sleepu_matches = sorted(glob.glob(sleepu_pattern))
+
+    if checkme_matches:
+        if len(checkme_matches) > 1:
+            print(f"  Note: found {len(checkme_matches)} Checkme files, using {os.path.basename(checkme_matches[-1])}")
+        files['oximeter'] = checkme_matches[-1]
+        files['oximeter_type'] = 'checkme'
+        if sleepu_matches:
+            print(f"  Note: Checkme O2 Ultra found, using it instead of SleepU")
+    elif sleepu_matches:
+        if len(sleepu_matches) > 1:
+            print(f"  Note: found {len(sleepu_matches)} SleepU files, using {os.path.basename(sleepu_matches[-1])}")
+        files['oximeter'] = sleepu_matches[-1]
+        files['oximeter_type'] = 'sleepu'
+    else:
+        raise FileNotFoundError(
+            f"No file matching 'Checkme O2 Ultra 2355_*.csv' or 'SleepU 6294_*.csv' in {input_dir}")
 
     # Breathing analysis files (exact names)
     exact = {
@@ -114,6 +129,78 @@ def read_sleepu(filepath, ref_date):
     t0 = (first_dt_obj - ref_midnight).total_seconds() / 60.0
     interval_sec = (second_dt_obj - first_dt_obj).total_seconds()
     dt_min = interval_sec / 60.0
+    return {'t0': round(t0, 4), 'dt': round(dt_min, 6), 'spo2': spo2, 'hr': hr, 'mot': mot}
+
+
+def read_checkme(filepath, ref_date, bin_seconds=4):
+    """Read Checkme O2 Ultra CSV (1-second sampling) and resample to bin_seconds.
+    Within each bin: SpO2=min, HR=round(mean), Motion=max.
+    Returns same format as read_sleepu:
+       {t0: start_minutes, dt: interval_minutes, spo2: [...], hr: [...], mot: [...]}
+    """
+    # First pass: read all valid samples with timestamps
+    ref_midnight = datetime.combine(ref_date, datetime.min.time())
+    raw = []  # list of (seconds_from_midnight, o2, pulse, motion)
+    with open(filepath, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                dt = parse_sleepu_time(row['Time'])  # same timestamp format
+            except (ValueError, KeyError):
+                continue
+
+            o2 = row.get('Oxygen Level', '').strip()
+            pulse = row.get('Pulse Rate', '').strip()
+            motion = row.get('Motion', '').strip()
+
+            sec = (dt - ref_midnight).total_seconds()
+
+            if o2 == '--' or pulse == '--':
+                raw.append((sec, None, None, None))
+                continue
+            o2v = int(o2)
+            pv = int(pulse)
+            mv = int(motion) if motion != '--' else 0
+            if o2v < 70 or pv < 30:
+                raw.append((sec, None, None, None))
+                continue
+            raw.append((sec, o2v, pv, mv))
+
+    if not raw:
+        return {'t0': 0, 'dt': bin_seconds / 60.0, 'spo2': [], 'hr': [], 'mot': []}
+
+    # Create fixed-width bins starting at first sample
+    t_start = raw[0][0]
+    t_end = raw[-1][0]
+    dt_min = bin_seconds / 60.0
+    spo2, hr, mot = [], [], []
+
+    bin_start = t_start
+    ri = 0  # index into raw
+    while bin_start <= t_end:
+        bin_end = bin_start + bin_seconds
+        # Collect samples in [bin_start, bin_end)
+        o2_vals, pr_vals, mot_vals = [], [], []
+        while ri < len(raw) and raw[ri][0] < bin_end:
+            _, o2, pr, mv = raw[ri]
+            if o2 is not None:
+                o2_vals.append(o2)
+                pr_vals.append(pr)
+                mot_vals.append(mv)
+            ri += 1
+
+        if o2_vals:
+            spo2.append(min(o2_vals))
+            hr.append(round(sum(pr_vals) / len(pr_vals)))
+            mot.append(max(mot_vals))
+        else:
+            spo2.append(None)
+            hr.append(None)
+            mot.append(None)
+
+        bin_start += bin_seconds
+
+    t0 = t_start / 60.0
     return {'t0': round(t0, 4), 'dt': round(dt_min, 6), 'spo2': spo2, 'hr': hr, 'mot': mot}
 
 
@@ -855,12 +942,13 @@ for (let i = 0; i < hrData.length; i++) {
 // Detect "good sleep" periods (≥20 min contiguous)
 //   1. No apnea events
 //   2. No obstructions (moderate or severe)
-//   3. SpO2 ≥ 96%
+//   3. SpO2 ≥ threshold (96% for SleepU, 95% for Checkme)
 //   4. 15-min HR MA non-increasing
 // ============================================================
 const GOOD_MIN_DURATION = 15; // minutes
 const HR_RISE_TOL = 1.0;     // bpm tolerance for "non-increasing"
 const HR_LOOKBACK = 30;      // samples (~2 min) for slope check
+const GOOD_SPO2_MIN = %%GOOD_SPO2_MIN%%;  // SpO2 threshold for restful detection
 
 // Build sorted event intervals for quick overlap checks
 const evtIntervals = [];
@@ -881,12 +969,12 @@ for (let i = 0; i < hrData.length; i++) {
   }
   if (hasEvent) continue;
 
-  // Check 3: SpO2 ≥ 96% (find nearest SpO2 sample)
+  // Check 3: SpO2 ≥ threshold (find nearest SpO2 sample)
   // Binary-ish search: SpO2 data is same resolution as HR from same source
   let spo2Ok = false;
   for (let si = Math.max(0, i - 2); si <= Math.min(spo2Data.length - 1, i + 2); si++) {
     if (Math.abs(spo2Data[si].t - t) < 0.2) {
-      if (spo2Data[si].v >= 96) spo2Ok = true;
+      if (spo2Data[si].v >= GOOD_SPO2_MIN) spo2Ok = true;
       break;
     }
   }
@@ -1517,11 +1605,14 @@ def main():
 
     print(f"Found input files:")
     for key, path in files.items():
+        if key == 'oximeter_type':
+            continue
         print(f"  {key}: {os.path.basename(path)}")
 
-    # Determine reference date from the SleepU filename or first timestamp
-    # Use the first SleepU timestamp to get the starting date
-    with open(files['sleepu'], newline='', encoding='utf-8-sig') as f:
+    oximeter_type = files['oximeter_type']
+
+    # Determine reference date from the oximeter filename or first timestamp
+    with open(files['oximeter'], newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         first_row = next(reader)
         first_dt = parse_sleepu_time(first_row['Time'])
@@ -1529,7 +1620,12 @@ def main():
     print(f"  Reference date: {ref_date}")
 
     # Read all data
-    sleepu = read_sleepu(files['sleepu'], ref_date)
+    if oximeter_type == 'checkme':
+        sleepu = read_checkme(files['oximeter'], ref_date)
+        oximeter_label = "Checkme O2 Ultra"
+    else:
+        sleepu = read_sleepu(files['oximeter'], ref_date)
+        oximeter_label = "SleepU"
     rr = read_resp_rate(files['resp_rate'], ref_date)
     apnea = read_apnea(files['apnea'], ref_date)
     obstr = read_obstructions(files['obstruct'], ref_date)
@@ -1586,7 +1682,7 @@ def main():
     odi_4pct = compute_odi(sleepu['spo2'], interval_min, desat_threshold=4)
 
     print(f"\nData loaded:")
-    print(f"  SleepU samples: {len(sleepu['spo2'])} (full resolution, interval={sleepu['dt']*60:.1f}s)")
+    print(f"  {oximeter_label} samples: {len(sleepu['spo2'])} (resampled to interval={sleepu['dt']*60:.1f}s)")
     print(f"  Resp rate epochs: {len(rr)}")
     print(f"  Apnea events: {len(apnea)}")
     print(f"  Obstructions: {len(obstr)}")
@@ -1615,7 +1711,8 @@ def main():
 
     subtitle = (f"{ref_date.strftime('%Y-%m-%d')} {minutes_to_clock(first_t)} "
                 f"&rarr; {end_date.strftime('%Y-%m-%d')} {minutes_to_clock(last_t)} "
-                f"&nbsp;&middot;&nbsp; {format_duration(first_t, last_t)} recording")
+                f"&nbsp;&middot;&nbsp; {format_duration(first_t, last_t)} recording"
+                f" &nbsp;&middot;&nbsp; {oximeter_label}")
     # append apnea summary to subtitle for the dashboard
     subtitle += f" &nbsp;&nbsp; • &nbsp;Apneas &gt;10s: {apnea_count_gt10}, &gt;50s: {apnea_count_gt50}"
     subtitle += f" &nbsp;&nbsp; • &nbsp;ODI(3%): {odi_3pct}/hr, ODI(4%): {odi_4pct}/hr"
@@ -1632,6 +1729,9 @@ def main():
     }
     data_json = json.dumps(data, separators=(',', ':'))
 
+    # SpO2 threshold for "Restful" detection: lower by 1% for Checkme
+    good_spo2_min = 95 if oximeter_type == 'checkme' else 96
+
     # Generate HTML
     html = HTML_TEMPLATE
     html = html.replace('%%TITLE_DATE%%', title_date)
@@ -1641,6 +1741,7 @@ def main():
     html = html.replace('%%T_MAX%%', str(round(t_max, 1)))
     html = html.replace('%%VERSION%%', VERSION)
     html = html.replace('%%BUILD_DATE%%', BUILD_DATE)
+    html = html.replace('%%GOOD_SPO2_MIN%%', str(good_spo2_min))
 
     # Write output
     output_path = os.path.join(input_dir, "sleep_dashboard.html")
