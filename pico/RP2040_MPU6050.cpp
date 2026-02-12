@@ -5,10 +5,7 @@
 // 5 Hz output rate for breathing + cardiac band capture.
 // Prints via USB serial and logs to SD card.
 // Uses Wire1 for I2C and SPI1 for SD card.
-// Blue LED timecode: 1Hz heartbeat without time sync, then :0=long-long, 15=short, 30=short-short, 
-// 45=short-short-short with tick on other seconds. Dark zones around marks encode position within 10-minute cycle. 
-// Sync by sending "SYNC HH:MM:SS" over serial at startup (e.g. "SYNC 14:30:00").
-// 2026-02-010 J.Beale
+// 2026-02-11 J.Beale
 
 /*
 use this platformio.ini for building and uploading:
@@ -56,6 +53,17 @@ float cgx, cgy, cgz;
 // millis() value when PC timestamp was received (0 if no timestamp)
 unsigned long millis_at_time_sync = 0;
 
+// Crystal drift correction: positive = crystal runs slow (RP2040 lags wall clock).
+// Measured via drift log against NTP-synced PC. Adjust to match your board/temperature.
+static const float PPM_CORRECTION = 10.6f;
+
+// Returns drift-corrected elapsed ms since time sync.
+// Compensates for crystal frequency error so reported time tracks wall clock.
+unsigned long correctedElapsed() {
+  unsigned long raw = millis() - millis_at_time_sync;
+  return raw + (unsigned long)(raw * (PPM_CORRECTION / 1e6f));
+}
+
 // noise floor values
 float nf_rot, nf_total, nf_rms;
 
@@ -68,8 +76,8 @@ float nf_rot, nf_total, nf_rms;
 // :00 even min = long-long    :00 odd min = long-short
 // :15 = 1 short   :30 = 2 short   :45 = 3 short
 // 40ms tick at start of each second, except dark zones around marks.
-// Dark zone before :15,:30,:45 = 2s. Before :00 = 2 + minute_pair (2-6s),
-// encoding position within 10-minute cycle.  1 s dark after all marks.
+// Dark zone before :15,:30,:45 = 2s. Before :00 = 2+minute_pair (2-6s),
+// encoding position within 10-minute cycle.  1s dark after all marks.
 // No sync = 1Hz heartbeat.
 
 static const int BLINK_SHORT = 80;   // ms
@@ -150,8 +158,8 @@ void loop1() {
     return;
   }
 
-  // compute current wall-clock position
-  unsigned long elapsed_ms = millis() - millis_at_time_sync;
+  // compute current wall-clock position (drift-corrected)
+  unsigned long elapsed_ms = correctedElapsed();
   long current_sod = sync_second_of_day + (long)(elapsed_ms / 1000);
   // handle day wrap (>86400) just in case
   current_sod = current_sod % 86400;
@@ -189,15 +197,15 @@ void loop1() {
     if (!nearMark(sec_in_min, minute)) {
       blinkTick();
     }
-    // wait for next second boundary
-    unsigned long now_ms = millis() - millis_at_time_sync;
+    // wait for next second boundary (using corrected time)
+    unsigned long now_ms = correctedElapsed();
     unsigned long ms_into_sec = now_ms % 1000;
     if (ms_into_sec < 990) {
       delay(990 - ms_into_sec);  // sleep until just before next second
     }
     // spin-wait the last few ms for tight alignment
     unsigned long next_sec_ms = (now_ms / 1000 + 1) * 1000;
-    while ((millis() - millis_at_time_sync) < next_sec_ms) { /* spin */ }
+    while (correctedElapsed() < next_sec_ms) { /* spin */ }
   }
 }
 
@@ -310,7 +318,7 @@ void setup() {
   digitalWrite(LED_PIN, HIGH);
 
   Serial.println();
-  Serial.println("=== RP2040_MPU6050 v3.0 ===");
+  Serial.println("=== RP2040_MPU6050 v3.1 ===");
   Serial.print("Boot at ");
   Serial.print(millis());
   Serial.println(" ms");
@@ -318,7 +326,8 @@ void setup() {
   Serial.print(AVG_TIME * 1000, 0);
   Serial.print(" ms  Output rate: ");
   Serial.print(1.0f / AVG_TIME, 1);
-  Serial.println(" Hz");
+  Serial.print(" Hz  PPM correction: ");
+  Serial.println(PPM_CORRECTION, 1);
 
   // --- I2C on Wire1 (Qwiic) ---
   Serial.println("1: Init Wire1 (SDA=6 SCL=7)...");
@@ -383,8 +392,7 @@ void setup() {
         break;
       }
     }
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-    delay(50);
+    delay(1);
   }
 
   // --- Create log file ---
@@ -516,7 +524,7 @@ void loop() {
   float total = max(0.0f, wr.total_impulse  - nf_total * NF_SCALE);
   float rms   = max(0.0f, wr.accel_rms      - nf_rms   * NF_SCALE);
 
-  uint32_t msec = millis() - millis_at_time_sync;
+  uint32_t msec = correctedElapsed();
 
   // format output line: 6 columns, compact
   char line[80];
