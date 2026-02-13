@@ -11,6 +11,7 @@ Input files (in specified directory):
   breathing_analysis_report_respiratory_rate.csv  - Breaths per minute
   breathing_analysis_report_apnea_events.csv     - Apnea gap events
   breathing_analysis_report_obstructions.csv     - Obstruction events
+  MOT_*_breath.csv                               - Tilt-based breathing envelope (optional)
 
 Usage: python generate_sleep_dashboard.py <input_directory>
 """
@@ -22,8 +23,8 @@ import json
 import glob
 from datetime import datetime, timedelta
 
-VERSION = "1.3.0"
-BUILD_DATE = "2026-02-10"
+VERSION = "1.4.1"
+BUILD_DATE = "2026-02-13"
 
 
 def find_input_files(input_dir):
@@ -65,6 +66,14 @@ def find_input_files(input_dir):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Missing required file: {name}")
         files[key] = path
+
+    # Optional: tilt-based breathing envelope CSV
+    breath_pattern = os.path.join(input_dir, "MOT_*_breath.csv")
+    breath_matches = sorted(glob.glob(breath_pattern))
+    if breath_matches:
+        files['tilt_breath'] = breath_matches[-1]
+        if len(breath_matches) > 1:
+            print(f"  Note: found {len(breath_matches)} breath files, using {os.path.basename(breath_matches[-1])}")
 
     return files
 
@@ -214,7 +223,7 @@ def read_resp_rate(filepath, ref_date):
             except (ValueError, KeyError):
                 continue
             t = dt_to_minutes(dt, ref_date)
-            data.append([t, int(row['breaths_per_minute'].strip())])
+            data.append([t, round(float(row['breaths_per_minute'].strip()), 1)])
     return data
 
 
@@ -245,6 +254,60 @@ def read_obstructions(filepath, ref_date):
             sev = 1 if row['severity'].strip() == 'severe' else 0
             data.append([t, float(row['duration_sec'].strip()), sev])
     return data
+
+
+def read_tilt_breath(filepath, ref_date):
+    """Read tilt-based breathing envelope CSV.
+    Returns dict: {tiltRR: [[t, bpm], ...], tiltEnv: [[t, deg], ...]}
+    where t is minutes since midnight of ref_date."""
+    start_time = None
+    with open(filepath, 'r') as f:
+        first = f.readline().strip()
+        if first.startswith('# start '):
+            start_time = first[8:].split('sync_millis')[0].strip()
+
+    if not start_time:
+        print(f"  Warning: no start time in {filepath}, skipping tilt breath data")
+        return None
+
+    try:
+        t0_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        print(f"  Warning: cannot parse start time '{start_time}', skipping tilt breath data")
+        return None
+
+    ref_midnight = datetime.combine(ref_date, datetime.min.time())
+    t0_minutes = (t0_dt - ref_midnight).total_seconds() / 60.0
+
+    tilt_rr = []
+    tilt_env = []
+    with open(filepath, newline='') as f:
+        # skip comment lines
+        lines = f.readlines()
+    header_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith('seconds,'):
+            header_idx = i
+            break
+    if header_idx is None:
+        print(f"  Warning: no header found in {filepath}")
+        return None
+
+    import io
+    reader = csv.DictReader(io.StringIO(''.join(lines[header_idx:])))
+    for row in reader:
+        try:
+            sec = float(row['seconds'])
+            t_min = t0_minutes + sec / 60.0
+            env_val = float(row['envelope_deg'])
+            tilt_env.append([round(t_min, 4), round(env_val, 4)])
+            bpm_str = row.get('breaths_per_min', '').strip()
+            if bpm_str:
+                tilt_rr.append([round(t_min, 4), round(float(bpm_str), 1)])
+        except (ValueError, KeyError):
+            continue
+
+    return {'tiltRR': tilt_rr, 'tiltEnv': tilt_env}
 
 
 def compute_time_range(sleepu, rr):
@@ -328,7 +391,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   .legend {
     display: flex;
-    gap: 20px;
+    gap: 12px;
     flex-wrap: wrap;
     margin-bottom: 6px;
     padding: 6px 16px;
@@ -341,7 +404,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: 11px;
     font-family: 'IBM Plex Mono', monospace;
     color: #8899aa;
   }
@@ -479,6 +542,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="legend-item"><div class="legend-swatch" id="lsw-hr" style="background:#e85878"></div>Heart Rate (bpm)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-hrma" style="background:rgba(255,220,80,0.85)"></div>HR Trend (~5m avg)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-resp" style="background:#58d888"></div>Resp. Rate (br/min)</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-tiltrr" style="background:#40d0d0"></div>Tilt Resp. Rate</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-tiltenv" style="background:rgba(64,208,208,0.4)"></div>Breath Envelope (°)</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnea" style="background:rgba(255,80,60,0.5)"></div>Apnea Event</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnealong" style="background:rgba(255,220,40,0.8)"></div>Apnea &gt;50s</div>
   <div class="legend-item"><div class="legend-swatch dot" id="lsw-omod" style="background:#f0a030"></div>Obstruction (mod)</div>
@@ -535,6 +600,9 @@ const THEMES = {
     modLabel: 'rgba(240,160,48,0.4)',
     motionBar: 'rgba(160,140,220,0.7)',
     motionAxis: 'rgba(160,140,220,0.7)',
+    tiltResp: '#40d0d0',
+    tiltEnv: 'rgba(64,208,208,0.15)',
+    tiltEnvLine: 'rgba(64,208,208,0.4)',
     hrMA: 'rgba(255,220,80,0.85)',
     apneaLong: 'rgba(255,220,40,0.8)',
     apneaLongText: '#ffe060',
@@ -570,6 +638,9 @@ const THEMES = {
     modLabel: 'rgba(200,120,0,0.5)',
     motionBar: 'rgba(80,60,160,0.65)',
     motionAxis: 'rgba(80,60,140,0.8)',
+    tiltResp: '#008888',
+    tiltEnv: 'rgba(0,136,136,0.10)',
+    tiltEnvLine: 'rgba(0,136,136,0.35)',
     hrMA: 'rgba(180,120,0,0.85)',
     apneaLong: 'rgba(200,160,0,0.75)',
     apneaLongText: '#806000',
@@ -585,6 +656,10 @@ function updateLegendColors() {
   document.getElementById('lsw-hr').style.background = theme.hr;
   document.getElementById('lsw-hrma').style.background = theme.hrMA;
   document.getElementById('lsw-resp').style.background = theme.resp;
+  const tiltRREl = document.getElementById('lsw-tiltrr');
+  if (tiltRREl) tiltRREl.style.background = theme.tiltResp;
+  const tiltEnvEl = document.getElementById('lsw-tiltenv');
+  if (tiltEnvEl) tiltEnvEl.style.background = theme.tiltEnvLine;
   document.getElementById('lsw-apnea').style.background = theme.apneaBar;
   document.getElementById('lsw-apnealong').style.background = theme.apneaLong;
   document.getElementById('lsw-omod').style.background = theme.obstrMod;
@@ -639,7 +714,7 @@ const ctx = canvas.getContext('2d');
 
 const DPR = window.devicePixelRatio || 1;
 // Panel proportional weights: SpO2, HR, Resp, Events, Motion
-const PANEL_WEIGHTS = [0.25, 0.25, 0.20, 0.20, 0.10];
+const PANEL_WEIGHTS = [0.25, 0.25, 0.22, 0.22, 0.06];
 const PANEL_GAP = 4;
 const MARGIN = { top: 6, right: 24, bottom: 28, left: 54 };
 
@@ -875,6 +950,9 @@ for (let i = 0; i < _su.spo2.length; i++) {
 const rrData    = RAW.rr.map(d => ({t: d[0], v: d[1]}));
 const apneaData = RAW.apnea.map(d => ({t: d[0], dur: d[1]}));
 const obstrData = RAW.obstr.map(d => ({t: d[0], dur: d[1], sev: d[2]}));
+const tiltRRData  = (RAW.tiltRR  || []).map(d => ({t: d[0], v: d[1]}));
+const tiltEnvData = (RAW.tiltEnv || []).map(d => ({t: d[0], v: d[1]}));
+const hasTilt = tiltRRData.length > 0;
 
 // ============================================================
 // Compute dynamic Y-axis ranges from data
@@ -888,8 +966,10 @@ const SPO2_MAX = 100;
 const HR_MIN = Math.max(30, Math.floor((Math.min(...hrVals) - 3) / 5) * 5);
 const HR_MAX = Math.min(200, Math.ceil((Math.max(...hrVals) + 3) / 5) * 5);
 const RR_MIN = 0;
-const RR_MAX = Math.ceil((Math.max(...rrVals) + 2) / 5) * 5;
-const MOT_MAX = Math.max(10, Math.ceil(Math.max(...motData.map(d => d.v)) / 5) * 5);
+const allRRVals = rrVals.concat(tiltRRData.map(d => d.v));
+const RR_MAX = Math.ceil((Math.max(...allRRVals) + 2) / 5) * 5;
+const MOT_MAX = Math.min(50, Math.max(10, Math.ceil(Math.max(...motData.map(d => d.v)) / 5) * 5));
+const ENV_MAX = hasTilt ? Math.min(5, Math.ceil(Math.max(...tiltEnvData.map(d => d.v)) * 10) / 10) : 1;
 
 // Compute apnea Y-axis range (seconds)
 const APNEA_MAX_DUR = apneaData.length > 0
@@ -1045,15 +1125,22 @@ function draw() {
   ctx.setLineDash([]);
   drawLine(spo2Data, 't', 'v', SPO2_MIN, SPO2_MAX, 0, theme.spo2, 1.0);
 
-  // Label SpO2 dips below 85%
+  // Label SpO2 dips below 85% (skip overlapping labels)
   ctx.font = 'bold 11px IBM Plex Mono';
   ctx.fillStyle = theme.spo2DipText;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
+  let lastLabelRight = -Infinity;
+  const LABEL_PAD = 4; // minimum pixel gap between labels
   for (const dip of spo2Dips) {
     const dx = tToX(dip.t);
     const dy = valToY(dip.v, SPO2_MIN, SPO2_MAX, 0);
-    ctx.fillText(dip.v + '%', dx, dy + 3);
+    const txt = dip.v + '%';
+    const tw = ctx.measureText(txt).width;
+    const labelLeft = dx - tw / 2;
+    if (labelLeft < lastLabelRight + LABEL_PAD) continue; // skip overlap
+    ctx.fillText(txt, dx, dy + 3);
+    lastLabelRight = dx + tw / 2;
   }
 
   // Panel 1: HR
@@ -1065,6 +1152,70 @@ function draw() {
   drawYAxis(RR_MIN, RR_MAX, 2, rrTicks, 'Resp br/m', theme.resp);
   drawArea(rrData, 't', 'v', RR_MIN, RR_MAX, 2, theme.respArea);
   drawLine(rrData, 't', 'v', RR_MIN, RR_MAX, 2, theme.resp, 1.2);
+
+  // Tilt-based breathing data overlay on Panel 2
+  if (hasTilt) {
+    // Envelope amplitude as filled area (mapped to right Y axis in degrees)
+    const P2_TOP = panelTop(2);
+    const P2_H = PANEL_HEIGHTS[2];
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(MARGIN.left, P2_TOP, plotW, P2_H);
+    ctx.clip();
+    ctx.fillStyle = theme.tiltEnv;
+    ctx.beginPath();
+    let started = false;
+    for (const d of tiltEnvData) {
+      const x = tToX(d.t);
+      if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
+      const yTop = P2_TOP + P2_H - (Math.min(d.v, ENV_MAX) / ENV_MAX) * (P2_H - 8) - 4;
+      const yBot = P2_TOP + P2_H - 4;
+      if (!started) { ctx.moveTo(x, yBot); started = true; }
+      ctx.lineTo(x, yTop);
+    }
+    // close back along bottom
+    for (let i = tiltEnvData.length - 1; i >= 0; i--) {
+      const x = tToX(tiltEnvData[i].t);
+      if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
+      ctx.lineTo(x, P2_TOP + P2_H - 4);
+      break;
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // Envelope top line
+    ctx.strokeStyle = theme.tiltEnvLine;
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    started = false;
+    for (const d of tiltEnvData) {
+      const x = tToX(d.t);
+      if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
+      const y = P2_TOP + P2_H - (Math.min(d.v, ENV_MAX) / ENV_MAX) * (P2_H - 8) - 4;
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // Right Y-axis label for envelope (degrees)
+    ctx.save();
+    ctx.fillStyle = theme.tiltEnvLine;
+    ctx.font = '10px IBM Plex Mono, monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    const envTopY = P2_TOP + 4;
+    const envBotY = P2_TOP + P2_H - 4;
+    ctx.fillText(ENV_MAX.toFixed(1) + '°', MARGIN.left + plotW + 4, envTopY);
+    ctx.fillText('0°', MARGIN.left + plotW + 4, envBotY);
+    ctx.restore();
+
+    // Tilt resp rate as dashed line
+    ctx.save();
+    ctx.setLineDash([4, 3]);
+    drawLine(tiltRRData, 't', 'v', RR_MIN, RR_MAX, 2, theme.tiltResp, 1.2);
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
 
   // Panel 3: Events (apnea bars scaled to seconds Y-axis)
   const EVT_TOP = panelTop(3);
@@ -1336,6 +1487,12 @@ chartArea.addEventListener('mousemove', (e) => {
   if (hr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hr}"></div>HR: ${hr.v} bpm</div>`;
   if (hrm) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hrMA}"></div>HR avg: ${hrm.v} bpm</div>`;
   if (rr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.resp}"></div>Resp: ${rr.v} br/min</div>`;
+  if (hasTilt) {
+    const trr = findNearest(tiltRRData, t);
+    const tenv = findNearest(tiltEnvData, t);
+    if (trr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.tiltResp}"></div>Tilt Resp: ${trr.v.toFixed(1)} br/min</div>`;
+    if (tenv) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.tiltEnvLine}"></div>Envelope: ${tenv.v.toFixed(2)}°</div>`;
+  }
   if (mo && mo.v > 0) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.motionAxis}"></div>Motion: ${mo.v}</div>`;
   if (apnStr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.obstrSevere}"></div>${apnStr}</div>`;
 
@@ -1447,7 +1604,7 @@ function savePNG(exportScale) {
   const isLight = document.body.classList.contains('light-theme');
 
   // --- Measure header content from DOM ---
-  const titleText = document.querySelector('h1').textContent;
+  const titleText = document.querySelector('h1').childNodes[0].textContent.trim();
   const subtitleText = document.querySelector('.subtitle').textContent;
   const legendItems = [];
   document.querySelectorAll('.legend-item').forEach(item => {
@@ -1475,8 +1632,8 @@ function savePNG(exportScale) {
   // Pre-measure legend to determine if it wraps
   const tmpC = document.createElement('canvas');
   const tmpX = tmpC.getContext('2d');
-  tmpX.font = '12px IBM Plex Mono';
-  const LEG_ITEM_GAP = 20;
+  tmpX.font = '11px IBM Plex Mono';
+  const LEG_ITEM_GAP = 12;
   const LEG_SWATCH_W = 20;
   const maxLegW = W - 32;
   let rows = [[]];
@@ -1541,7 +1698,7 @@ function savePNG(exportScale) {
   oc.stroke();
 
   // Legend items
-  oc.font = '12px IBM Plex Mono, monospace';
+  oc.font = '11px IBM Plex Mono, monospace';
   let ly = legBoxY + LEG_PAD;
   for (const row of rows) {
     let lx = 32;
@@ -1658,6 +1815,19 @@ def main():
     apnea = read_apnea(files['apnea'], ref_date)
     obstr = read_obstructions(files['obstruct'], ref_date)
 
+    # Optional tilt-based breathing data
+    tilt_data = None
+    if 'tilt_breath' in files:
+        tilt_data = read_tilt_breath(files['tilt_breath'], ref_date)
+        if tilt_data:
+            # Clip to oximeter time range
+            oxi_t0 = sleepu['t0']
+            oxi_t1 = oxi_t0 + (len(sleepu['spo2']) - 1) * sleepu['dt']
+            tilt_data['tiltRR'] = [p for p in tilt_data['tiltRR'] if oxi_t0 <= p[0] <= oxi_t1]
+            tilt_data['tiltEnv'] = [p for p in tilt_data['tiltEnv'] if oxi_t0 <= p[0] <= oxi_t1]
+            print(f"  Tilt resp rate samples: {len(tilt_data['tiltRR'])} (clipped to oximeter range)")
+            print(f"  Tilt envelope samples: {len(tilt_data['tiltEnv'])}")
+
     # -> New: compute apnea counts for dashboard (seconds)
     apnea_count_gt10 = sum(1 for a in apnea if a[1] > 10.0)
     apnea_count_gt50 = sum(1 for a in apnea if a[1] > 50.0)
@@ -1755,6 +1925,9 @@ def main():
         'apnea': apnea,
         'obstr': obstr,
     }
+    if tilt_data:
+        data['tiltRR'] = tilt_data['tiltRR']
+        data['tiltEnv'] = tilt_data['tiltEnv']
     data_json = json.dumps(data, separators=(',', ':'))
 
     # SpO2 threshold for "Restful" detection: lower by 1% for Checkme

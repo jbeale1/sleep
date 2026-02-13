@@ -890,8 +890,12 @@ def write_events_csv(hourly_data, output_path):
 
 
 def write_breathing_rate_csv(hourly_data, output_path):
-    """Write respiratory rate (breaths/min) in 1-minute epochs with wall-clock timestamps."""
+    """Write respiratory rate (breaths/min) in 10-second epochs with wall-clock timestamps.
+    Uses a 60-second centered sliding window for smoothing."""
     import csv
+
+    EPOCH_SEC = 10       # output interval
+    WINDOW_SEC = 60      # sliding window for rate computation
 
     # Collect all breath cycles with wall-clock times
     all_cycles = []
@@ -905,27 +909,31 @@ def write_breathing_rate_csv(hourly_data, output_path):
 
     # Sort by wall clock time
     all_cycles.sort(key=lambda c: c['wall_clock_time'])
+    cycle_times = [c['wall_clock_time'] for c in all_cycles]
 
-    # Determine time range and create 1-minute bins
-    t_first = all_cycles[0]['wall_clock_time']
-    t_last = all_cycles[-1]['wall_clock_time']
+    # Determine time range
+    t_first = cycle_times[0]
+    t_last = cycle_times[-1]
 
-    # Round down to start of minute
-    bin_start = t_first.replace(second=0, microsecond=0)
+    # Round down to start of 10-second epoch
+    epoch_sec = t_first.second - (t_first.second % EPOCH_SEC)
+    bin_start = t_first.replace(second=epoch_sec, microsecond=0)
     bin_end = t_last.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
-    # Count cycles per 1-minute bin
-    bins = {}
+    half_win = timedelta(seconds=WINDOW_SEC / 2)
+
+    # For each 10-second epoch, count breaths in centered 60-second window
+    rows = []
     t = bin_start
     while t < bin_end:
-        bins[t] = 0
-        t += timedelta(minutes=1)
-
-    for cycle in all_cycles:
-        ct = cycle['wall_clock_time']
-        bin_key = ct.replace(second=0, microsecond=0)
-        if bin_key in bins:
-            bins[bin_key] += 1
+        win_start = t - half_win
+        win_end = t + half_win
+        # Count breaths in window
+        count = sum(1 for ct in cycle_times if win_start <= ct < win_end)
+        # Scale to breaths per minute
+        bpm = count * (60.0 / WINDOW_SEC)
+        rows.append((t, round(bpm, 1)))
+        t += timedelta(seconds=EPOCH_SEC)
 
     # Write CSV
     rate_path = output_path.replace('.csv', '_respiratory_rate.csv')
@@ -933,10 +941,10 @@ def write_breathing_rate_csv(hourly_data, output_path):
         writer = csv.writer(f)
         writer.writerow(['timestamp', 'breaths_per_minute'])
 
-        for t in sorted(bins.keys()):
-            writer.writerow([t.strftime('%Y-%m-%d %H:%M:%S'), bins[t]])
+        for t, bpm in rows:
+            writer.writerow([t.strftime('%Y-%m-%d %H:%M:%S'), bpm])
 
-    print(f"Respiratory rate CSV written to: {rate_path}")
+    print(f"Respiratory rate CSV written to: {rate_path}  ({len(rows)} epochs, {EPOCH_SEC}s interval, {WINDOW_SEC}s window)")
 
 
 def print_console_report(hourly_stats, hourly_data=None):

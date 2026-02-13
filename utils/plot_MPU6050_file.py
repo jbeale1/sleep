@@ -11,7 +11,7 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
-from scipy.signal import butter, sosfiltfilt, find_peaks
+from scipy.signal import butter, sosfiltfilt, find_peaks, hilbert
 
 # --- Configuration ---
 BREATH_LO = 0.1    # Hz (6 breaths/min)
@@ -32,7 +32,7 @@ def load_and_plot(csv_path, save_path=None):
     with open(csv_path, 'r') as f:
         first = f.readline().strip()
         if first.startswith('# start ') and 'unknown' not in first:
-            start_time = first[8:]
+            start_time = first[8:].split('sync_millis')[0].strip()
             skip = 2  # skip comment + header
 
     data = np.genfromtxt(csv_path, delimiter=',', skip_header=skip)
@@ -40,7 +40,10 @@ def load_and_plot(csv_path, save_path=None):
         print(f"Error: expected 6 columns (msec,pitch,roll,rot,total,rms), got {data.shape}")
         sys.exit(1)
 
-    t = (data[:, 0] - data[0, 0]) / 1000.0
+    if start_time:
+        t = data[:, 0] / 1000.0  # seconds after labelled start time
+    else:
+        t = (data[:, 0] - data[0, 0]) / 1000.0  # seconds relative to first sample
     pitch = data[:, 1]
     roll  = data[:, 2]
     rot   = data[:, 3]
@@ -49,7 +52,7 @@ def load_and_plot(csv_path, save_path=None):
 
     dt_median = np.median(np.diff(t))
     fs = 1.0 / dt_median
-    duration_min = t[-1] / 60.0
+    duration_min = (t[-1] - t[0]) / 60.0
 
     print(f"File: {csv_path}")
     print(f"Samples: {len(t)},  Duration: {duration_min:.1f} min,  Fs: {fs:.2f} Hz")
@@ -60,6 +63,15 @@ def load_and_plot(csv_path, save_path=None):
 
     breath_filt  = sosfiltfilt(breath_sos, pitch)
     cardiac_filt = sosfiltfilt(cardiac_sos, rms)
+
+    # --- Breathing envelope via Hilbert transform ---
+    analytic = hilbert(breath_filt)
+    env_amplitude = np.abs(analytic)  # instantaneous amplitude, always >= 0
+    # smooth envelope to remove ripple at breathing frequency
+    env_lp_sos = butter(2, 0.05, btype='low', fs=fs, output='sos')
+    env_amplitude = sosfiltfilt(env_lp_sos, env_amplitude)
+    env_upper = env_amplitude
+    env_lower = -env_amplitude
 
     # use minutes for long recordings, seconds for short
     # if we have a start time, show real clock time on x-axis for long recordings
@@ -122,8 +134,11 @@ def load_and_plot(csv_path, save_path=None):
 
     # 2: Breathing
     ax2.plot(t_plot, breath_filt, 'darkgreen', linewidth=0.8)
+    ax2.plot(t_plot, env_upper, 'green', linewidth=1.0, alpha=0.5, linestyle='--', label='Envelope')
+    ax2.plot(t_plot, env_lower, 'green', linewidth=1.0, alpha=0.5, linestyle='--')
     ax2.set_yscale('symlog', linthresh=LINTHRESH_BREATH)
     ax2.set_ylabel("Degrees")
+    ax2.legend(loc='upper left', fontsize=9)
     ax2.grid(True, alpha=0.3, which='both')
     ax2.set_title(f"Breathing — pitch BP {BREATH_LO}–{BREATH_HI} Hz (symlog, linear < {LINTHRESH_BREATH}°)", fontsize=10)
 
@@ -220,7 +235,7 @@ def load_and_plot(csv_path, save_path=None):
 
         autoscale_y_to_visible()
 
-        if span_min > 5.0:
+        if span_min > 30.0:
             breath_text.set_text('')
             cardiac_text.set_text('')
             fig.canvas.draw_idle()
@@ -228,11 +243,32 @@ def load_and_plot(csv_path, save_path=None):
 
         # Breathing: min peak spacing ~1.5s (40 breaths/min max)
         br = compute_rate(breath_filt, t, s0, s1, 1.5)
+        br_lines = []
         if br:
             mean_r, std_r, n_peaks = br
-            breath_text.set_text(f'Resp: {mean_r:.1f} ± {std_r:.1f} /min  (n={n_peaks})')
+            br_lines.append(f'Resp: {mean_r:.1f} ± {std_r:.1f} /min  (n={n_peaks})')
         else:
-            breath_text.set_text('Resp: —')
+            br_lines.append('Resp: —')
+
+        # Envelope modulation stats
+        mask_vis = (t >= s0) & (t <= s1)
+        env_vis = env_amplitude[mask_vis]
+        t_vis = t[mask_vis]
+        if len(env_vis) > 10:
+            a_max, a_min = np.max(env_vis), np.min(env_vis)
+            if (a_max + a_min) > 0:
+                mod_index = (a_max - a_min) / (a_max + a_min)
+                br_lines.append(f'Mod:  {mod_index:.0%}')
+            # find periodicity of envelope amplitude
+            min_env_dist = max(1, int(5.0 * fs))  # envelope peaks at least 5s apart
+            env_pks, _ = find_peaks(env_vis, distance=min_env_dist,
+                                    prominence=np.std(env_vis) * 0.3)
+            if len(env_pks) >= 2:
+                env_intervals = np.diff(t_vis[env_pks])
+                mean_period = np.mean(env_intervals)
+                br_lines.append(f'Env:  {mean_period:.0f}s period (n={len(env_pks)})')
+
+        breath_text.set_text('\n'.join(br_lines))
 
         # Cardiac: min peak spacing ~0.4s (150 bpm max)
         cr = compute_rate(cardiac_filt, t, s0, s1, 0.4)
@@ -263,7 +299,7 @@ def load_and_plot(csv_path, save_path=None):
             return
         ax_data = [
             [pitch[mask], roll[mask]],
-            [breath_filt[mask]],
+            [breath_filt[mask], env_upper[mask], env_lower[mask]],
             [cardiac_filt[mask]],
             [total[mask], rms[mask]],
         ]
