@@ -5,6 +5,7 @@ Outputs a sub-sampled CSV at 1-second intervals with:
   - seconds from start
   - breathing envelope amplitude (degrees)
   - breathing rate (breaths/min, 30s sliding window)
+  - roll angle (degrees, low-pass smoothed ~60s window)
 
 Usage: python3 breath_envelope_csv.py <input.csv> [output.csv]
 If no output file given, uses input name with _breath suffix.
@@ -24,6 +25,8 @@ OUTPUT_INTERVAL = 1.0  # seconds between output samples
 RATE_WINDOW = 60.0  # seconds, sliding window for breath rate
 
 ABS_FLOOR = 0.10 # reject tilt peaks below this absolute level, to avoid noise peaks when breathing is very shallow
+
+ROLL_LP = 0.017   # Hz lowpass for roll smoothing (~60s window)
 
 
 def process(csv_path, out_path=None):
@@ -47,6 +50,7 @@ def process(csv_path, out_path=None):
         t = (data[:, 0] - data[0, 0]) / 1000.0
 
     pitch = data[:, 1]
+    roll  = data[:, 2]
     dt_median = np.median(np.diff(t))
     fs = 1.0 / dt_median
     duration_min = (t[-1] - t[0]) / 60.0
@@ -58,6 +62,11 @@ def process(csv_path, out_path=None):
 
     # bandpass filter for breathing
     breath_sos = butter(2, [BREATH_LO, BREATH_HI], btype='bandpass', fs=fs, output='sos')
+    breath_filt = sosfiltfilt(breath_sos, pitch)
+
+    # lowpass smooth roll (~60s window)
+    roll_lp_sos = butter(2, ROLL_LP, btype='low', fs=fs, output='sos')
+    roll_smooth = sosfiltfilt(roll_lp_sos, roll)
     breath_filt = sosfiltfilt(breath_sos, pitch)
 
     # Hilbert envelope + smoothing
@@ -88,6 +97,7 @@ def process(csv_path, out_path=None):
     # sub-sample at 1-second intervals
     t_out = np.arange(t[0], t[-1], OUTPUT_INTERVAL)
     env_out = np.interp(t_out, t, env_amplitude)
+    roll_out = np.interp(t_out, t, roll_smooth)
 
     # breathing rate via sliding window
     half_win = RATE_WINDOW / 2.0
@@ -107,7 +117,7 @@ def process(csv_path, out_path=None):
     header_lines = []
     if start_time:
         header_lines.append(f'# start {start_time}')
-    header_lines.append('seconds,envelope_deg,breaths_per_min')
+    header_lines.append('seconds,envelope_deg,breaths_per_min,roll_deg')
 
     with open(out_path, 'w') as f:
         for line in header_lines:
@@ -116,7 +126,8 @@ def process(csv_path, out_path=None):
             sec = f'{t_out[i]:.1f}'
             env = f'{env_out[i]:.4f}'
             bpm = f'{rate_out[i]:.1f}' if not np.isnan(rate_out[i]) else ''
-            f.write(f'{sec},{env},{bpm}\n')
+            rl = f'{roll_out[i]:.2f}'
+            f.write(f'{sec},{env},{bpm},{rl}\n')
 
     n_valid = np.sum(~np.isnan(rate_out))
     print(f"Output: {out_path}")

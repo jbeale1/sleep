@@ -23,7 +23,7 @@ import json
 import glob
 from datetime import datetime, timedelta
 
-VERSION = "1.4.1"
+VERSION = "1.5.3"
 BUILD_DATE = "2026-02-13"
 
 
@@ -258,7 +258,7 @@ def read_obstructions(filepath, ref_date):
 
 def read_tilt_breath(filepath, ref_date):
     """Read tilt-based breathing envelope CSV.
-    Returns dict: {tiltRR: [[t, bpm], ...], tiltEnv: [[t, deg], ...]}
+    Returns dict: {tiltRR: [[t, bpm], ...], tiltEnv: [[t, deg], ...], tiltRoll: [[t, deg], ...]}
     where t is minutes since midnight of ref_date."""
     start_time = None
     with open(filepath, 'r') as f:
@@ -281,6 +281,7 @@ def read_tilt_breath(filepath, ref_date):
 
     tilt_rr = []
     tilt_env = []
+    tilt_roll = []
     with open(filepath, newline='') as f:
         # skip comment lines
         lines = f.readlines()
@@ -304,10 +305,13 @@ def read_tilt_breath(filepath, ref_date):
             bpm_str = row.get('breaths_per_min', '').strip()
             if bpm_str:
                 tilt_rr.append([round(t_min, 4), round(float(bpm_str), 1)])
+            roll_str = row.get('roll_deg', '').strip()
+            if roll_str:
+                tilt_roll.append([round(t_min, 4), round(float(roll_str), 2)])
         except (ValueError, KeyError):
             continue
 
-    return {'tiltRR': tilt_rr, 'tiltEnv': tilt_env}
+    return {'tiltRR': tilt_rr, 'tiltEnv': tilt_env, 'tiltRoll': tilt_roll}
 
 
 def compute_time_range(sleepu, rr):
@@ -544,10 +548,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="legend-item"><div class="legend-swatch" id="lsw-resp" style="background:#58d888"></div>Resp. Rate (br/min)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-tiltrr" style="background:#40d0d0"></div>Tilt Resp. Rate</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-tiltenv" style="background:rgba(64,208,208,0.4)"></div>Breath Envelope (°)</div>
-  <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnea" style="background:rgba(255,80,60,0.5)"></div>Apnea Event</div>
+  <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnea" style="background:rgba(255,80,60,0.5)"></div>Apnea</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnealong" style="background:rgba(255,220,40,0.8)"></div>Apnea &gt;50s</div>
-  <div class="legend-item"><div class="legend-swatch dot" id="lsw-omod" style="background:#f0a030"></div>Obstruction (mod)</div>
-  <div class="legend-item"><div class="legend-swatch dot" id="lsw-osev" style="background:#ff4040"></div>Obstruction (sev)</div>
+  <div class="legend-item"><span style="display:inline-flex;align-items:center;gap:3px;">Obstr: <div class="legend-swatch dot" id="lsw-omod" style="background:#f0a030"></div>mod <div class="legend-swatch dot" id="lsw-osev" style="background:#ff4040"></div>sev</span></div>
+  <div class="legend-item"><div class="legend-swatch bar" id="lsw-roll" style="background:linear-gradient(to right, hsl(240,75%,55%), hsl(180,75%,55%), hsl(120,75%,55%), hsl(60,75%,55%), hsl(0,75%,55%)); border-radius:2px;"></div>Body Roll (°)</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-mot" style="background:rgba(160,140,220,0.5)"></div>Motion</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-good" style="background:rgba(80,200,120,0.5); border-top: 2px dotted rgba(80,200,120,0.8); height:0; width:18px;"></div>Restful (&ge;15m)</div>
 </div>
@@ -609,6 +613,7 @@ const THEMES = {
     spo2DipText: '#ff6060',
     goodSleep: 'rgba(80,200,120,0.5)',
     ahiHourlyText: 'rgba(255,255,255,0.85)',
+    rollAxis: 'rgba(200,180,140,0.7)',
   },
   light: {
     bodyBg: '#ffffff',
@@ -647,6 +652,7 @@ const THEMES = {
     spo2DipText: '#cc0000',
     goodSleep: 'rgba(40,160,80,0.45)',
     ahiHourlyText: 'rgba(0,0,0,0.8)',
+    rollAxis: 'rgba(120,100,60,0.8)',
   }
 };
 let theme = THEMES.dark;
@@ -714,7 +720,7 @@ const ctx = canvas.getContext('2d');
 
 const DPR = window.devicePixelRatio || 1;
 // Panel proportional weights: SpO2, HR, Resp, Events, Motion
-const PANEL_WEIGHTS = [0.25, 0.25, 0.22, 0.22, 0.06];
+const PANEL_WEIGHTS = [0.25, 0.25, 0.22, 0.16, 0.12];
 const PANEL_GAP = 4;
 const MARGIN = { top: 6, right: 24, bottom: 28, left: 54 };
 
@@ -952,7 +958,30 @@ const apneaData = RAW.apnea.map(d => ({t: d[0], dur: d[1]}));
 const obstrData = RAW.obstr.map(d => ({t: d[0], dur: d[1], sev: d[2]}));
 const tiltRRData  = (RAW.tiltRR  || []).map(d => ({t: d[0], v: d[1]}));
 const tiltEnvData = (RAW.tiltEnv || []).map(d => ({t: d[0], v: d[1]}));
+const tiltRollData = (RAW.tiltRoll || []).map(d => ({t: d[0], v: d[1]}));
 const hasTilt = tiltRRData.length > 0;
+const hasRoll = tiltRollData.length > 0;
+
+// Map roll angle to color using full rainbow, auto-scaled to data range.
+// Computed range from actual data gives maximum contrast for small shifts.
+const ROLL_MIN = hasRoll ? Math.min(...tiltRollData.map(d => d.v)) : 0;
+const ROLL_MAX = hasRoll ? Math.max(...tiltRollData.map(d => d.v)) : 1;
+// Use percentile-based range to ignore brief outliers (e.g. getting out of bed)
+const rollSorted = hasRoll ? tiltRollData.map(d => d.v).sort((a,b) => a - b) : [0];
+const ROLL_P05 = rollSorted[Math.floor(rollSorted.length * 0.03)];
+const ROLL_P95 = rollSorted[Math.floor(rollSorted.length * 0.97)];
+const ROLL_LO = ROLL_P05;
+const ROLL_HI = ROLL_P95;
+const ROLL_SPAN = Math.max(ROLL_HI - ROLL_LO, 0.5); // avoid div-by-zero
+
+function rollToColor(angle, alpha) {
+  const a = alpha || 0.7;
+  // Clamp to percentile range, then map 0..1
+  const t = Math.max(0, Math.min(1, (angle - ROLL_LO) / ROLL_SPAN));
+  // Full rainbow hue sweep: 240 (blue) -> 180 (cyan) -> 120 (green) -> 60 (yellow) -> 0 (red)
+  const h = 240 - t * 240;
+  return `hsla(${Math.round(h)}, 75%, 55%, ${a})`;
+}
 
 // ============================================================
 // Compute dynamic Y-axis ranges from data
@@ -1428,6 +1457,20 @@ function draw() {
     ctx.fillStyle = theme.motionBar;
     ctx.fillRect(x - 0.5, y, 1.5, barH);
   }
+
+  // Roll angle color strip at top of motion panel
+  if (hasRoll) {
+    const rollH = 6;
+    const rollY = MOT_TOP + 1;
+    for (let i = 0; i < tiltRollData.length - 1; i++) {
+      const d = tiltRollData[i];
+      const x1 = tToX(d.t);
+      const x2 = tToX(tiltRollData[i + 1].t);
+      if (x2 < MARGIN.left || x1 > MARGIN.left + plotW) continue;
+      ctx.fillStyle = rollToColor(d.v);
+      ctx.fillRect(x1, rollY, Math.max(1, x2 - x1), rollH);
+    }
+  }
 }
 
 draw();
@@ -1494,6 +1537,10 @@ chartArea.addEventListener('mousemove', (e) => {
     if (tenv) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.tiltEnvLine}"></div>Envelope: ${tenv.v.toFixed(2)}°</div>`;
   }
   if (mo && mo.v > 0) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.motionAxis}"></div>Motion: ${mo.v}</div>`;
+  if (hasRoll) {
+    const rl = findNearest(tiltRollData, t);
+    if (rl) html += `<div class="tt-row"><div class="tt-dot" style="background:${rollToColor(rl.v, 1)}"></div>Roll: ${rl.v.toFixed(1)}°</div>`;
+  }
   if (apnStr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.obstrSevere}"></div>${apnStr}</div>`;
 
   tooltip.innerHTML = html;
@@ -1608,15 +1655,30 @@ function savePNG(exportScale) {
   const subtitleText = document.querySelector('.subtitle').textContent;
   const legendItems = [];
   document.querySelectorAll('.legend-item').forEach(item => {
-    const swatch = item.querySelector('.legend-swatch');
+    const swatches = item.querySelectorAll('.legend-swatch');
+    const swatch = swatches[0];
+    if (!swatch) return;
     const cs = getComputedStyle(swatch);
-    legendItems.push({
+    const entry = {
       color: cs.backgroundColor,
       borderColor: cs.borderTopColor,
       isDot: swatch.classList.contains('dot'),
       isBar: swatch.classList.contains('bar'),
       text: item.textContent.trim()
-    });
+    };
+    // Collect extra swatches for combined items (e.g. "Obstr: mod sev")
+    if (swatches.length > 1) {
+      entry.extraSwatches = [];
+      for (let s = 1; s < swatches.length; s++) {
+        const ecs = getComputedStyle(swatches[s]);
+        entry.extraSwatches.push({
+          color: ecs.backgroundColor,
+          isDot: swatches[s].classList.contains('dot'),
+          isBar: swatches[s].classList.contains('bar'),
+        });
+      }
+    }
+    legendItems.push(entry);
   });
 
   // --- Header layout constants ---
@@ -1703,6 +1765,31 @@ function savePNG(exportScale) {
   for (const row of rows) {
     let lx = 32;
     for (const item of row) {
+      // Combined items with multiple swatches (e.g. "Obstr: mod sev")
+      if (item.extraSwatches) {
+        oc.fillStyle = theme.legendText;
+        oc.textAlign = 'left';
+        oc.textBaseline = 'top';
+        // Draw: "Obstr: " then dot1 "mod " then dot2 "sev"
+        const label = 'Obstr: ';
+        oc.fillText(label, lx, ly);
+        lx += oc.measureText(label).width;
+        // First dot (mod)
+        oc.fillStyle = item.color;
+        oc.beginPath(); oc.arc(lx + 4, ly + 6, 4, 0, Math.PI * 2); oc.fill();
+        lx += 10;
+        oc.fillStyle = theme.legendText;
+        oc.fillText('mod ', lx, ly);
+        lx += oc.measureText('mod ').width;
+        // Second dot (sev)
+        oc.fillStyle = item.extraSwatches[0].color;
+        oc.beginPath(); oc.arc(lx + 4, ly + 6, 4, 0, Math.PI * 2); oc.fill();
+        lx += 10;
+        oc.fillStyle = theme.legendText;
+        oc.fillText('sev', lx, ly);
+        lx += oc.measureText('sev').width + LEG_ITEM_GAP;
+        continue;
+      }
       // Swatch
       oc.fillStyle = item.color;
       if (item.isDot) {
@@ -1710,6 +1797,16 @@ function savePNG(exportScale) {
         oc.arc(lx + 4, ly + 6, 4, 0, Math.PI * 2);
         oc.fill();
       } else if (item.isBar) {
+        // Special handling for gradient swatches (e.g. Roll)
+        if (item.text.includes('Roll')) {
+          const grad = oc.createLinearGradient(lx, 0, lx + 14, 0);
+          grad.addColorStop(0, 'hsl(240,75%,55%)');
+          grad.addColorStop(0.25, 'hsl(180,75%,55%)');
+          grad.addColorStop(0.5, 'hsl(120,75%,55%)');
+          grad.addColorStop(0.75, 'hsl(60,75%,55%)');
+          grad.addColorStop(1, 'hsl(0,75%,55%)');
+          oc.fillStyle = grad;
+        }
         oc.fillRect(lx, ly + 1, 14, 10);
       } else {
         // Check if this is the "Restful" item (dotted line style)
@@ -1825,8 +1922,10 @@ def main():
             oxi_t1 = oxi_t0 + (len(sleepu['spo2']) - 1) * sleepu['dt']
             tilt_data['tiltRR'] = [p for p in tilt_data['tiltRR'] if oxi_t0 <= p[0] <= oxi_t1]
             tilt_data['tiltEnv'] = [p for p in tilt_data['tiltEnv'] if oxi_t0 <= p[0] <= oxi_t1]
+            tilt_data['tiltRoll'] = [p for p in tilt_data.get('tiltRoll', []) if oxi_t0 <= p[0] <= oxi_t1]
             print(f"  Tilt resp rate samples: {len(tilt_data['tiltRR'])} (clipped to oximeter range)")
             print(f"  Tilt envelope samples: {len(tilt_data['tiltEnv'])}")
+            print(f"  Tilt roll samples: {len(tilt_data['tiltRoll'])}")
 
     # -> New: compute apnea counts for dashboard (seconds)
     apnea_count_gt10 = sum(1 for a in apnea if a[1] > 10.0)
@@ -1928,6 +2027,7 @@ def main():
     if tilt_data:
         data['tiltRR'] = tilt_data['tiltRR']
         data['tiltEnv'] = tilt_data['tiltEnv']
+        data['tiltRoll'] = tilt_data.get('tiltRoll', [])
     data_json = json.dumps(data, separators=(',', ':'))
 
     # SpO2 threshold for "Restful" detection: lower by 1% for Checkme
