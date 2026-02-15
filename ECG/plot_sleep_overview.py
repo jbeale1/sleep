@@ -26,6 +26,7 @@ import argparse
 import csv
 import io
 import re
+import sys
 from pathlib import Path
 from datetime import datetime
 import glob
@@ -54,10 +55,32 @@ if args.no_plot:
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
+# =============================================================
+# RESOLVE INPUT FILE (support both file and directory)
+# =============================================================
+def find_beats_csv(directory):
+    """
+    Search directory for the first ECG_<YYYYMMDD_HHMMSS>_beats.csv file.
+    Returns the full path to the matching file, or None if not found.
+    """
+    beats_pattern = re.compile(r'^ECG_\d{8}_\d{6}_beats\.csv$')
+    if not Path(directory).is_dir():
+        return None
+    
+    files = sorted(Path(directory).iterdir())
+    for filepath in files:
+        if filepath.is_file() and beats_pattern.match(filepath.name):
+            return str(filepath)
+    return None
 
-# =============================================================
-# DATA LOADERS
-# =============================================================
+# Check if input is a directory; if so, find the ECG beats CSV file
+if Path(args.beats_csv).is_dir():
+    found_file = find_beats_csv(args.beats_csv)
+    if found_file is None:
+        print(f"Error: No ECG_*_beats.csv file found in {args.beats_csv}")
+        sys.exit(1)
+    args.beats_csv = found_file
+    print(f"Found beats CSV: {args.beats_csv}")
 
 def load_beats_csv(filepath):
     """Load per-beat CSV exported by analyze_ecg.py.
@@ -370,10 +393,61 @@ def epoch_to_mpl(epoch_arr, ref_epoch):
     return ref_mpl + (np.asarray(epoch_arr) - ref_epoch) / 86400.0
 
 
-def format_time_axis(ax):
-    """Apply HH:MM tick labels with HH:MM:SS cursor readout."""
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=15))
+class AdaptiveTimeTicker(mdates.ticker.Locator):
+    """Tick locator that switches to second-level ticks when zoomed in < 5 min."""
+    def __call__(self):
+        vmin, vmax = self.axis.get_view_interval()
+        span_sec = (vmax - vmin) * 86400.0
+        if span_sec <= 300:
+            return self._second_ticks(vmin, vmax, span_sec)
+        else:
+            loc = mdates.AutoDateLocator(minticks=6, maxticks=15)
+            loc.set_axis(self.axis)
+            return loc()
+
+    def _second_ticks(self, vmin, vmax, span_sec):
+        from datetime import timedelta
+        if span_sec <= 30:
+            interval = 5
+        elif span_sec <= 60:
+            interval = 10
+        elif span_sec <= 120:
+            interval = 15
+        elif span_sec <= 300:
+            interval = 30
+        else:
+            interval = 60
+
+        dt_min = mdates.num2date(vmin).replace(microsecond=0)
+        dt_max = mdates.num2date(vmax)
+        cur = dt_min.replace(second=(dt_min.second // interval) * interval)
+        ticks = []
+        while cur <= dt_max:
+            ticks.append(mdates.date2num(cur))
+            cur += timedelta(seconds=interval)
+        return ticks
+
+
+class AdaptiveTimeFormatter(mdates.ticker.Formatter):
+    """Formatter that shows HH:MM:SS when zoomed in < 5 min, HH:MM otherwise."""
+    def __init__(self):
+        self._fmt_hms = mdates.DateFormatter('%H:%M:%S')
+        self._fmt_hm  = mdates.DateFormatter('%H:%M')
+
+    def __call__(self, x, pos=None):
+        ax = self.axis
+        vmin, vmax = ax.get_view_interval()
+        span_sec = (vmax - vmin) * 86400.0
+        if span_sec <= 300:
+            return self._fmt_hms(x, pos)
+        else:
+            return self._fmt_hm(x, pos)
+
+
+def format_time_axis(ax, duration_sec=None):
+    """Apply adaptive time tick labels that switch to HH:MM:SS on zoom."""
+    ax.xaxis.set_major_locator(AdaptiveTimeTicker())
+    ax.xaxis.set_major_formatter(AdaptiveTimeFormatter())
     ax.fmt_xdata = mdates.DateFormatter('%H:%M:%S')
     ax.set_xlabel('Time')
 
@@ -572,14 +646,22 @@ stem = re.sub(r'_beats$', '', stem)
 source_name = data['beats']['_metadata'].get('source', Path(args.beats_csv).name)
 fig.suptitle(f"Sleep Overview — {source_name}", fontsize=12, fontweight='bold')
 
+# Calculate total duration for axis formatting decision
+beats_start = data['beats']['epoch_s'][0]
+beats_end = data['beats']['epoch_s'][-1]
+duration_sec = beats_end - beats_start
+
 for i, (name, func, _) in enumerate(active_panels):
     func(axes[i], data, ref_epoch)
     axes[i].fmt_xdata = mdates.DateFormatter('%H:%M:%S')
 
 # Format the shared time axis on the bottom panel
-format_time_axis(axes[-1])
+format_time_axis(axes[-1], duration_sec)
 
 fig.tight_layout()
+
+
+
 out_path = f"{stem}_overview.png"
 fig.savefig(out_path, dpi=150, bbox_inches='tight')
 print(f"Saved {out_path}")
