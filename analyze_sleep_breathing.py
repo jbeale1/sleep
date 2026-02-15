@@ -647,6 +647,9 @@ def load_and_analyze_file(filepath):
         # Detect apnea gaps
         apnea_gaps = detect_apnea_gaps(audio, sr, breath_cycles)
         
+        # Multi-band envelope for noise envelope export
+        mb_times, mb_env = compute_multiband_envelope(audio, sr)
+        
         return {
             'filepath': filepath,
             'duration': duration,
@@ -655,7 +658,9 @@ def load_and_analyze_file(filepath):
             'breath_threshold': breath_thresh,
             'breath_events': breath_events,
             'breath_cycles': breath_cycles,
-            'apnea_gaps': apnea_gaps
+            'apnea_gaps': apnea_gaps,
+            'mb_times': mb_times,
+            'mb_envelope': mb_env
         }
     
     except Exception as e:
@@ -947,6 +952,79 @@ def write_breathing_rate_csv(hourly_data, output_path):
     print(f"Respiratory rate CSV written to: {rate_path}  ({len(rows)} epochs, {EPOCH_SEC}s interval, {WINDOW_SEC}s window)")
 
 
+def write_noise_envelope_csv(file_results, output_path):
+    """Write 1 Hz multi-band noise envelope in dB relative to noise floor.
+    Stitches envelopes from sequential MP3 files using filename timestamps."""
+    import csv
+
+    # Collect (wall_clock_epoch, snr_value) from each file's multi-band envelope
+    all_epochs = []
+    all_snr = []
+
+    for result in file_results:
+        if result is None:
+            continue
+        if result.get('mb_times') is None or result.get('mb_envelope') is None:
+            continue
+
+        # Get wall-clock start time from filename
+        file_t0 = parse_filename_timestamp(result['filepath'])
+        if file_t0 is None:
+            continue
+
+        t0_epoch = file_t0.timestamp()
+        mb_t = result['mb_times']       # seconds within file
+        mb_env = result['mb_envelope']   # SNR relative to noise floor
+
+        # Convert file-relative seconds to unix epoch
+        file_epochs = t0_epoch + mb_t
+        all_epochs.append(file_epochs)
+        all_snr.append(mb_env)
+
+    if not all_epochs:
+        print("No envelope data to write.")
+        return
+
+    # Concatenate all files
+    all_epochs = np.concatenate(all_epochs)
+    all_snr = np.concatenate(all_snr)
+
+    # Sort by time (should already be sorted if files are sequential)
+    sort_idx = np.argsort(all_epochs)
+    all_epochs = all_epochs[sort_idx]
+    all_snr = all_snr[sort_idx]
+
+    # Downsample to 1 Hz: for each 1-second bin, take the max SNR
+    t_start = np.floor(all_epochs[0])
+    t_end = np.ceil(all_epochs[-1])
+    bin_edges = np.arange(t_start, t_end + 1, 1.0)
+
+    out_epochs = []
+    out_db = []
+    for i in range(len(bin_edges) - 1):
+        mask = (all_epochs >= bin_edges[i]) & (all_epochs < bin_edges[i + 1])
+        if np.any(mask):
+            peak_snr = np.max(all_snr[mask])
+            # Convert to dB: 20*log10(snr), clamp floor at 0 dB (= noise floor)
+            db_val = 20.0 * np.log10(max(peak_snr, 1.0))
+            out_epochs.append(bin_edges[i] + 0.5)  # bin center
+            out_db.append(round(db_val, 1))
+
+    # Write CSV
+    env_path = output_path.replace('.csv', '_noise_envelope.csv')
+    start_str = datetime.fromtimestamp(out_epochs[0]).strftime('%Y-%m-%d %H:%M:%S')
+    with open(env_path, 'w', newline='') as f:
+        f.write(f"# start {start_str}\n")
+        f.write(f"# sample_rate_hz 1\n")
+        f.write(f"# units dB_re_noise_floor\n")
+        writer = csv.writer(f)
+        writer.writerow(['epoch_s', 'noise_db'])
+        for ep, db in zip(out_epochs, out_db):
+            writer.writerow([f"{ep:.3f}", db])
+
+    print(f"Noise envelope CSV written to: {env_path}  ({len(out_epochs)} samples, 1 Hz)")
+
+
 def print_console_report(hourly_stats, hourly_data=None):
     """Print formatted report to console."""
     sorted_hours = sorted(hourly_stats.keys())
@@ -1098,6 +1176,7 @@ def main():
     write_csv_report(hourly_stats, csv_path)
     write_events_csv(hourly_data, csv_path)
     write_breathing_rate_csv(hourly_data, csv_path)
+    write_noise_envelope_csv(file_results, csv_path)
     print_console_report(hourly_stats, hourly_data)
 
 
