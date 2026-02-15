@@ -49,6 +49,7 @@ char filename[40];  // long filename: MOT_2026-02-09_143022.csv
 // calibration offsets
 float cx, cy, cz;
 float cgx, cgy, cgz;
+float z_sign = 1.0f;  // gravity direction on Z, set during calibration
 
 // millis() value when PC timestamp was received (0 if no timestamp)
 unsigned long millis_at_time_sync = 0;
@@ -238,7 +239,7 @@ void measureWindow(WindowResult &r) {
     float now = millis() / 1000.0f;
     samples[n].ax = a.acceleration.x - cx;
     samples[n].ay = a.acceleration.y - cy;
-    samples[n].az = a.acceleration.z - cz;
+    samples[n].az = (a.acceleration.z - cz) * z_sign;
     samples[n].gx = g.gyro.x - cgx;
     samples[n].gy = g.gyro.y - cgy;
     samples[n].gz = g.gyro.z - cgz;
@@ -318,7 +319,7 @@ void setup() {
   digitalWrite(LED_PIN, HIGH);
 
   Serial.println();
-  Serial.println("=== RP2040_MPU6050 v3.1 ===");
+  Serial.println("=== RP2040_MPU6050 v3.2 ===");
   Serial.print("Boot at ");
   Serial.print(millis());
   Serial.println(" ms");
@@ -468,7 +469,9 @@ void setup() {
   }
   cx  /= CAL_N;
   cy  /= CAL_N;
-  cz   = cz / CAL_N - GRAVITY;
+  cz  /= CAL_N;
+  z_sign = (cz >= 0) ? 1.0f : -1.0f;  // detect which way is "up"
+  cz -= z_sign * GRAVITY;              // remove gravity, keep only bias
   cgx /= CAL_N;
   cgy /= CAL_N;
   cgz /= CAL_N;
@@ -480,6 +483,8 @@ void setup() {
   Serial.print(cgx, 4); Serial.print(", ");
   Serial.print(cgy, 4); Serial.print(", ");
   Serial.println(cgz, 4);
+  Serial.print("   Z-axis sign:   ");
+  Serial.println(z_sign > 0 ? "+1 (face up)" : "-1 (face down)");
 
   // --- Phase 2: Characterize noise floor ---
   Serial.print("7: Measuring noise floor (");
