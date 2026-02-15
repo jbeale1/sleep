@@ -1,761 +1,996 @@
 #!/usr/bin/env python3
 
 """
-ECG Beat Oscilloscope — R-peak triggered waveform viewer
+ECG single-lead analysis — comprehensive beat-by-beat metrics vs time.
 
-Displays successive P-QRS-T complexes aligned on R-peak, like an
-oscilloscope with stable triggering. Navigate beat-by-beat with
-keyboard controls.
+Reads a single-column CSV (µV at known sample rate) and produces a
+multi-panel dashboard of every standard and some non-standard ECG metrics.
 
-Overlays:
-  - Current beat (bold)
-  - Previous beat (ghost trace)
-  - Rolling average of last N beats (dashed)
-
-Controls:
-  Right / D      → next beat
-  Left  / A      → previous beat
-  Shift+Right    → skip 10 beats forward
-  Shift+Left     → skip 10 beats back
-  Home           → first beat
-  End            → last beat
-  Up / Down      → adjust rolling average window (N)
-  F              → toggle filter on/off (for raw files)
-  G              → toggle ghost trace (previous beat)
-  T              → toggle persistence (storage scope, last 20 beats)
-  R              → toggle rolling average
-  P              → toggle P-wave region highlight
-  1 / 2 / 3     → show 1, 2, or 3 beats at once
-  N              → toggle timeline: HR ↔ Noise
-  S              → save current view as PNG
-  Q / Esc        → quit
-
-  Timeline strip: click to jump, click+drag to scrub through recording
-                 scroll wheel to zoom, right-drag to pan, double-click or Home to reset
+Metrics per beat:
+  - R-R interval, instantaneous HR
+  - HRV: SDNN, RMSSD (rolling windows)
+  - QRS amplitude (R-peak value)
+  - QRS duration
+  - P-wave: amplitude, duration, notch depth, notch presence
+  - T-wave: amplitude, polarity
+  - QT interval, QTc (Bazett)
+  - ST-segment level
+  - Respiratory sinus arrhythmia envelope (from R-R modulation)
 
 Usage:
-  python ecg_scope.py <csv_file> [sample_rate] [--prefiltered]
-  python ecg_scope.py ECG_20260212.csv 250
-  python ecg_scope.py ECG_filtered.csv 250 --prefiltered
+  python analyze_ecg.py <csv_file> [sample_rate] [--prefiltered] [--no-plot] [--plot hr] [--csv-out]
+  python analyze_ecg.py ECG_20260213.csv 250
+  python analyze_ecg.py ECG_20260213.csv 250 --plot hr
+  python analyze_ecg.py ECG_filtered.csv 250 --prefiltered --no-plot
+
+Wall-clock time: auto-detects _sync.csv file for NTP-locked timestamps,
+falls back to YYYYMMDD_HHMMSS from filename, or elapsed time.
 
 J. Beale  2026-02
 """
 
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')
-import matplotlib.pyplot as plt
-matplotlib.rcParams['keymap.fullscreen'] = []  # free 'f' from fullscreen toggle
-matplotlib.rcParams['keymap.save'] = []        # free 's' from save dialog
-matplotlib.rcParams['keymap.pan'] = []         # free 'p' from pan mode
-matplotlib.rcParams['keymap.grid'] = []        # free 'g' from grid toggle
-matplotlib.rcParams['keymap.home'] = []        # free 'home' from reset view
-matplotlib.rcParams['keymap.quit'] = []        # free 'q' from quit (we handle it)
-from matplotlib.patches import Rectangle
-from matplotlib.gridspec import GridSpec
-import matplotlib.dates as mdates
 from scipy import signal
-from scipy.ndimage import uniform_filter1d, median_filter
+from scipy.ndimage import uniform_filter1d
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import sys
-import glob
+import os
 import re
-
-# =============================================================
-# CONFIGURATION
-# =============================================================
-DEFAULT_FS = 250
-
-# Display window around R-peak (ms)
-PRE_R_MS  = 300    # show 300ms before R-peak
-POST_R_MS = 500    # show 500ms after R-peak
-
-# Filtering (for raw data)
-HP_FREQ    = 0.5
-NOTCH_FREQ = 60
-NOTCH_Q    = 30
-LP_FREQ    = 40
-
-# Rolling average default window
-AVG_WINDOW_DEFAULT = 10
-
-# P-wave highlight region (ms before R)
-P_REGION_MS = (200, 40)   # 200–40ms before R
-
-# =============================================================
-# PARSE ARGS
-# =============================================================
 import argparse
 
-parser = argparse.ArgumentParser(description='ECG Beat Oscilloscope')
-parser.add_argument('csv_file', help='CSV file with ECG data')
-parser.add_argument('sample_rate', nargs='?', type=int, default=DEFAULT_FS,
-                    help=f'Sample rate in sps (default: {DEFAULT_FS})')
+# =============================================================
+# PARSE ARGUMENTS
+# =============================================================
+parser = argparse.ArgumentParser(description='ECG single-lead analysis dashboard')
+parser.add_argument('csv_file', help='CSV file with ECG data (single column, µV)')
+parser.add_argument('sample_rate', nargs='?', type=int, default=250,
+                    help='Sample rate in sps (default: 250)')
 parser.add_argument('--prefiltered', action='store_true',
                     help='Data is already filtered (skip filtering)')
+parser.add_argument('--no-plot', action='store_true', dest='no_plot',
+                    help='Save PNGs but do not display plots')
+parser.add_argument('--plot', choices=['all', 'hr'], default='all',
+                    help='Which plot(s) to produce (default: all)')
+parser.add_argument('--csv-out', action='store_true', dest='csv_out',
+                    help='Export per-beat metrics to CSV (same dir as input)')
 args = parser.parse_args()
+
+if args.no_plot:
+    matplotlib.use('Agg')
+
+import matplotlib.pyplot as plt
 
 CSV_FILE = args.csv_file
 FS = args.sample_rate
 
 # =============================================================
-# LOAD DATA
+# RESOLVE INPUT FILE (support both file and directory)
+# =============================================================
+def find_ecg_csv(directory):
+    """
+    Search directory for the first ECG_<YYYYMMDD_HHMMSS>.csv file.
+    Returns the full path to the matching file, or None if not found.
+    """
+    ecg_pattern = re.compile(r'^ECG_\d{8}_\d{6}\.csv$')
+    if not Path(directory).is_dir():
+        return None
+    
+    files = sorted(Path(directory).iterdir())
+    for filepath in files:
+        if filepath.is_file() and ecg_pattern.match(filepath.name):
+            return str(filepath)
+    return None
+
+# Check if input is a directory; if so, find the ECG CSV file
+if Path(CSV_FILE).is_dir():
+    found_file = find_ecg_csv(CSV_FILE)
+    if found_file is None:
+        print(f"Error: No ECG_*.csv file found in {CSV_FILE}")
+        sys.exit(1)
+    CSV_FILE = found_file
+    print(f"Found ECG file: {CSV_FILE}")
+
+# Filtering (applied with filtfilt for zero-phase)
+HP_FREQ = 0.5    # highpass (Hz)
+NOTCH_FREQ = 60   # powerline notch (Hz)
+LP_FREQ = 40      # lowpass (Hz)
+
+# Detection
+REFRACT_SEC = 0.40        # refractory period after R-peak (sec)
+QRS_SEARCH_MS = 80        # half-width for QRS onset/offset search (ms)
+P_WINDOW_MS = (200, 40)   # P-wave search window: 200–40 ms before R
+T_WINDOW_MS = (160, 550)  # T-wave search: 160–550 ms after R
+ST_MEASURE_MS = 80        # ST level measured this far after R (J+80)
+
+# Rolling HRV window
+HRV_WINDOW_BEATS = 20
+
+# =============================================================
+# LOAD & FILTER
 # =============================================================
 data_raw = np.loadtxt(CSV_FILE, delimiter=",", skiprows=1).flatten()
 N = len(data_raw)
+t = np.arange(N) / FS
+
 print(f"Loaded {N} samples ({N/FS:.1f}s) at {FS} sps from {CSV_FILE}")
 
-# =============================================================
-# FILTER DESIGN
-# =============================================================
+# Zero-phase filtering
 sos_hp = signal.butter(2, HP_FREQ, 'highpass', fs=FS, output='sos')
-b_n, a_n = signal.iirnotch(NOTCH_FREQ, Q=NOTCH_Q, fs=FS)
 sos_lp = signal.butter(4, LP_FREQ, 'lowpass', fs=FS, output='sos')
+b_n, a_n = signal.iirnotch(NOTCH_FREQ, Q=30, fs=FS)
 
-def apply_filters(data):
-    d = signal.sosfiltfilt(sos_hp, data)
-    d = signal.filtfilt(b_n, a_n, d)
-    d = signal.sosfiltfilt(sos_lp, d)
-    return d
-
-is_raw = not args.prefiltered
-if is_raw:
-    print(f"Data assumed raw, filtering enabled (use --prefiltered to skip)")
+if args.prefiltered:
+    ecg = data_raw.copy()
+    print("Data marked as pre-filtered, skipping filters")
 else:
-    print(f"Data marked as pre-filtered, skipping filters")
-
-ecg_filtered = apply_filters(data_raw)
-ecg_display = ecg_filtered.copy()  # start with filtered view
+    ecg = signal.sosfiltfilt(sos_hp, data_raw)
+    ecg = signal.filtfilt(b_n, a_n, ecg)
+    ecg = signal.sosfiltfilt(sos_lp, ecg)
+    print("Filtering applied (HP 0.5 Hz, notch 60 Hz, LP 40 Hz)")
 
 # =============================================================
-# R-PEAK DETECTION
+# WALL-CLOCK TIME (from sync file or filename timestamp)
 # =============================================================
-sos_det = signal.butter(2, [5, min(20, FS/2 - 1)], 'bandpass', fs=FS, output='sos')
-ecg_det = signal.sosfiltfilt(sos_det, ecg_filtered)
+import matplotlib.dates as mdates
+
+def parse_filename_timestamp(filepath):
+    """Extract YYYYMMDD_HHMMSS from filename, return epoch float or None."""
+    m = re.search(r'(\d{8})_(\d{6})', Path(filepath).stem)
+    if m:
+        ts = datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S')
+        # Assume local time; use as-is (naive datetime → treat as UTC for plotting)
+        return ts.timestamp()
+    return None
+
+def load_sync_file(csv_path):
+    """Look for matching _sync.csv; return (sample_idx, unix_time) arrays or None."""
+    sync_path = Path(csv_path).with_name(Path(csv_path).stem + '_sync.csv')
+    if not sync_path.exists():
+        return None
+    try:
+        sync_data = np.loadtxt(sync_path, delimiter=',', skiprows=1)
+        return sync_data[:, 0], sync_data[:, 1]
+    except Exception as e:
+        print(f"Warning: could not read sync file: {e}")
+        return None
+
+def sample_to_epoch(sample_indices):
+    """Map sample indices to unix epoch timestamps."""
+    return np.interp(sample_indices, sync_idx, sync_epoch)
+
+# Try sync file first, then filename
+sync_result = load_sync_file(CSV_FILE)
+if sync_result is not None:
+    sync_idx, sync_epoch = sync_result
+    t0_epoch = sample_to_epoch(np.array([0]))[0]
+    t0_str = datetime.fromtimestamp(t0_epoch).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"Sync file loaded ({len(sync_idx)} entries), start: {t0_str}")
+    time_source = 'sync'
+else:
+    t0_epoch = parse_filename_timestamp(CSV_FILE)
+    if t0_epoch is not None:
+        # Create simple linear mapping: sample 0 → t0_epoch
+        sync_idx = np.array([0, N - 1], dtype=float)
+        sync_epoch = np.array([t0_epoch, t0_epoch + (N - 1) / FS])
+        t0_str = datetime.fromtimestamp(t0_epoch).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"Start time from filename: {t0_str} (estimated)")
+        time_source = 'filename'
+    else:
+        # No time info: use elapsed seconds from 00:00:00
+        sync_idx = np.array([0, N - 1], dtype=float)
+        sync_epoch = np.array([0.0, (N - 1) / FS])
+        print("No timestamp found; using elapsed time")
+        time_source = 'elapsed'
+
+def epoch_to_mpl(epoch_arr):
+    """Convert unix epoch array to matplotlib date numbers."""
+    ref_epoch = sync_epoch[0]
+    if time_source == 'elapsed':
+        # No real timestamp; use epoch 0 = 1970-01-01 00:00:00
+        ref_mpl = mdates.date2num(datetime(1970, 1, 1))
+    else:
+        ref_mpl = mdates.date2num(datetime.fromtimestamp(ref_epoch))
+    return ref_mpl + (np.asarray(epoch_arr) - ref_epoch) / 86400.0
+
+def format_time_axis(ax):
+    """Apply HH:MM formatting to an x-axis with reasonable tick density."""
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    loc = mdates.AutoDateLocator(minticks=6, maxticks=15)
+    ax.xaxis.set_major_locator(loc)
+    ax.fmt_xdata = mdates.DateFormatter('%H:%M:%S')
+    ax.set_xlabel('Time')
+
+# Pre-compute wall-clock arrays for sample times and beat times
+t_epoch = sample_to_epoch(np.arange(N, dtype=float))
+t_wall = epoch_to_mpl(t_epoch)
+
+# =============================================================
+# R-PEAK DETECTION (Pan-Tompkins inspired)
+# =============================================================
+# Bandpass 5-20 Hz for detection only
+sos_det = signal.butter(2, [5, 20], 'bandpass', fs=FS, output='sos')
+ecg_det = signal.sosfiltfilt(sos_det, ecg)
 ecg_det_sq = ecg_det ** 2
-ma_len = max(1, int(0.12 * FS))
+
+# Moving average
+ma_len = int(0.12 * FS)
 ecg_ma = uniform_filter1d(ecg_det_sq, ma_len)
 
-refract = int(0.40 * FS)
-threshold = 0.3 * np.max(ecg_ma[:FS * 2])
-min_threshold = 0.05 * np.max(ecg_ma[:FS * 2])  # floor to prevent P-wave triggers
+# Adaptive threshold
+refract = int(REFRACT_SEC * FS)
+threshold = 0.3 * np.max(ecg_ma[:FS*2])  # init from first 2 sec
+min_threshold = 0.05 * np.max(ecg_ma[:FS*2])  # floor to prevent P-wave triggers
 peaks = []
-i = int(0.5 * FS)
+i = int(0.5 * FS)  # skip first 0.5s
 
 while i < N - int(0.5 * FS):
     if ecg_ma[i] > threshold:
-        # Search wider window for true R-peak in filtered ECG
+        # Search for true R-peak in original filtered ECG
         search_start = max(0, i - int(0.15 * FS))
         search_end = min(N, i + int(0.15 * FS))
-        r_idx = search_start + np.argmax(ecg_filtered[search_start:search_end])
+        r_idx = search_start + np.argmax(ecg[search_start:search_end])
         peaks.append(r_idx)
+
+        # Adapt threshold
         threshold = 0.3 * ecg_ma[i] + 0.7 * threshold
         threshold = max(threshold, min_threshold)
+
         i = r_idx + refract
     else:
+        # Decay threshold slowly to avoid losing beats
         threshold *= 0.9995
         threshold = max(threshold, min_threshold)
         i += 1
 
 peaks = np.array(peaks)
-n_beats = len(peaks)
-print(f"Detected {n_beats} R-peaks")
+print(f"Detected {len(peaks)} R-peaks (initial pass)")
 
-if n_beats < 3:
-    print("Too few beats detected.")
+# =============================================================
+# MISSED-BEAT RECOVERY (second pass)
+# =============================================================
+# Scan for R-R gaps that are ~2x the local median, then re-search
+# those gaps for the strongest energy peak that stands out above
+# the noise floor within the gap itself.
+RECOVERY_RR_RATIO = 1.6   # gap must be > this × local median R-R
+RECOVERY_WINDOW = 10       # beats for local median R-R estimate
+RECOVERY_SNR = 3.0         # gap peak must be this × gap median energy
+
+recovered = []
+if len(peaks) > RECOVERY_WINDOW + 2:
+    rr_all = np.diff(peaks)
+    for i in range(len(rr_all)):
+        # Local median R-R from surrounding beats
+        lo = max(0, i - RECOVERY_WINDOW // 2)
+        hi = min(len(rr_all), i + RECOVERY_WINDOW // 2 + 1)
+        local_rr = np.median(rr_all[lo:hi])
+
+        if rr_all[i] > RECOVERY_RR_RATIO * local_rr:
+            # Search the gap for energy peaks
+            gap_start = peaks[i] + refract
+            gap_end = peaks[i + 1] - refract
+            if gap_end <= gap_start:
+                continue
+
+            gap_ma = ecg_ma[gap_start:gap_end]
+            gap_noise = np.percentile(gap_ma, 25)
+            gap_peak_val = np.max(gap_ma)
+
+            # Accept if the best candidate stands out above the gap noise
+            if gap_peak_val > RECOVERY_SNR * max(gap_noise, 1.0):
+                # Refine position using squared bandpass signal (no MA delay)
+                gap_sq = ecg_det_sq[gap_start:gap_end]
+                qrs_pos = gap_start + np.argmax(gap_sq)
+
+                # Find the actual R-peak (max |ecg|) within ±30ms
+                hw_refine = int(0.03 * FS)
+                ss = max(0, qrs_pos - hw_refine)
+                se = min(N, qrs_pos + hw_refine + 1)
+                r_idx = ss + np.argmax(ecg[ss:se])
+                recovered.append(r_idx)
+
+n_recovered = len(recovered)
+if n_recovered:
+    peaks = np.sort(np.concatenate([peaks, recovered]))
+    # Remove any duplicates (peaks within refractory distance)
+    keep = [0]
+    for i in range(1, len(peaks)):
+        if peaks[i] - peaks[keep[-1]] >= refract:
+            keep.append(i)
+    peaks = peaks[keep]
+    print(f"Recovered {n_recovered} missed beats → {len(peaks)} total")
+else:
+    print(f"No missed beats found → {len(peaks)} total")
+
+if len(peaks) < 5:
+    print("Too few beats detected. Check data/filter settings.")
     sys.exit(1)
 
 # =============================================================
-# WALL-CLOCK TIME
+# BEAT-BY-BEAT MEASUREMENTS
 # =============================================================
-def parse_timestamp_from_filename(filepath):
-    """Extract datetime from YYYYMMDD_HHMMSS pattern in filename."""
-    name = Path(filepath).stem
-    parts = name.split('_')
-    for i in range(len(parts) - 1):
-        if len(parts[i]) == 8 and len(parts[i+1]) >= 6:
-            try:
-                dt = datetime.strptime(f"{parts[i]}_{parts[i+1][:6]}",
-                                       "%Y%m%d_%H%M%S")
-                return dt
-            except ValueError:
-                continue
-    return None
+def sample(ms):
+    """Convert ms to samples."""
+    return int(ms * FS / 1000)
 
-def load_sync_file(csv_path):
-    """Try to load *_sync.csv alongside the data file."""
-    stem = Path(csv_path).stem
-    parent = Path(csv_path).parent
-    # Try exact match first
-    sync_path = parent / f"{stem}_sync.csv"
-    if sync_path.exists():
-        idxs, epochs = [], []
-        with open(sync_path) as f:
-            for line in f:
-                if line.startswith('#') or line.startswith('sample'):
-                    continue
-                parts = line.strip().split(',')
-                if len(parts) >= 2:
-                    idxs.append(int(parts[0]))
-                    epochs.append(float(parts[1]))
-        if len(idxs) >= 2:
-            return np.array(idxs), np.array(epochs)
-    return None, None
+n_beats = len(peaks)
 
-# Build epoch array for each beat
-sync_idx, sync_epoch = load_sync_file(CSV_FILE)
-time_source = 'unknown'
-if sync_idx is not None:
-    beat_epoch = np.interp(peaks.astype(float), sync_idx, sync_epoch)
-    time_source = 'sync'
-    print(f"Using sync file for wall-clock time")
-else:
-    dt = parse_timestamp_from_filename(CSV_FILE)
-    if dt:
-        t0_epoch = dt.timestamp()
-        beat_epoch = t0_epoch + peaks / FS
-        time_source = 'filename'
-        print(f"Using filename timestamp: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
-    else:
-        beat_epoch = peaks / FS
-        time_source = 'elapsed'
-        print(f"No timestamp found, using elapsed seconds")
+# Pre-allocate arrays (NaN = unmeasured)
+rr_ms       = np.full(n_beats, np.nan)
+hr_bpm      = np.full(n_beats, np.nan)
+qrs_amp     = np.full(n_beats, np.nan)
+qrs_dur_ms  = np.full(n_beats, np.nan)
 
-# Convert to matplotlib date numbers
-ref_epoch = beat_epoch[0]
-ref_mpl = mdates.date2num(datetime.fromtimestamp(ref_epoch)) if time_source != 'elapsed' else 0
-def epoch_to_mpl(ep):
-    if time_source == 'elapsed':
-        return ep / 60.0  # minutes
-    return ref_mpl + (ep - ref_epoch) / 86400.0
+p_amp       = np.full(n_beats, np.nan)
+p_dur_ms    = np.full(n_beats, np.nan)
+p_notch_uv  = np.full(n_beats, np.nan)  # notch depth in µV (0 = no notch)
+p_notched   = np.full(n_beats, False)    # boolean: notch detected
 
-beat_mpl = np.array([epoch_to_mpl(e) for e in beat_epoch])
+t_amp       = np.full(n_beats, np.nan)
+qt_ms       = np.full(n_beats, np.nan)
+qtc_ms      = np.full(n_beats, np.nan)
+st_level    = np.full(n_beats, np.nan)
+
+is_pvc       = np.full(n_beats, False)
+pvc_score    = np.full(n_beats, np.nan)   # 0 = normal, higher = more abnormal
+qrs_corr     = np.full(n_beats, np.nan)   # correlation with template
+
+beat_time   = t[peaks]  # time of each R-peak
+beat_epoch  = sample_to_epoch(peaks.astype(float))
+beat_wall   = epoch_to_mpl(beat_epoch)
+
+for i, r in enumerate(peaks):
+    # --- QRS amplitude ---
+    qrs_amp[i] = ecg[r]
+
+    # --- R-R interval ---
+    if i > 0:
+        rr_samp = r - peaks[i-1]
+        rr_ms[i] = rr_samp / FS * 1000
+        if 300 < rr_ms[i] < 2000:
+            hr_bpm[i] = 60000 / rr_ms[i]
+        else:
+            rr_ms[i] = np.nan
+
+    # --- QRS duration (derivative-based) ---
+    qrs_hw = sample(QRS_SEARCH_MS)
+    if r - qrs_hw >= 0 and r + qrs_hw < N:
+        seg = ecg[r - qrs_hw : r + qrs_hw + 1]
+        deriv = np.abs(np.diff(seg))
+        # Smooth derivative (5-sample / 20ms) to bridge momentary dips
+        deriv_smooth = uniform_filter1d(deriv, min(5, len(deriv)))
+        max_deriv = np.max(deriv_smooth)
+
+        if max_deriv > 0:
+            d_thresh = 0.10 * max_deriv  # 10% of peak slope
+            above = np.where(deriv_smooth > d_thresh)[0]
+            if len(above) >= 2:
+                onset = above[0]
+                offset = above[-1]
+                dur = (offset - onset) / FS * 1000
+                if 20 < dur < 200:
+                    qrs_dur_ms[i] = dur
+
+    # --- P-wave analysis ---
+    p_start = r - sample(P_WINDOW_MS[0])
+    p_end   = r - sample(P_WINDOW_MS[1])
+    if p_start >= 0 and p_end < N and p_start < p_end:
+        p_seg = ecg[p_start:p_end]
+        p_baseline = np.median(ecg[max(0, p_start - sample(30)):p_start])
+
+        p_seg_rel = p_seg - p_baseline
+
+        if len(p_seg_rel) > 5:
+            p_peak_idx = np.argmax(p_seg_rel)
+            p_amp[i] = p_seg_rel[p_peak_idx]
+
+            # P-wave duration: where it rises above 20% of peak
+            if p_amp[i] > 15:  # only if P-wave is detectable
+                p_thresh = 0.2 * p_amp[i]
+                above = np.where(p_seg_rel > p_thresh)[0]
+                if len(above) >= 2:
+                    p_dur_ms[i] = (above[-1] - above[0]) / FS * 1000
+
+                # --- P-wave notch detection ---
+                # Find the two highest local maxima and the minimum between them
+                # Smooth slightly to avoid noise-induced false notches
+                if len(p_seg_rel) > 7:
+                    p_smooth = uniform_filter1d(p_seg_rel.astype(float), 3)
+                    # Find all local maxima
+                    local_max_idx, _ = signal.find_peaks(p_smooth,
+                                                         height=0.2 * p_amp[i],
+                                                         distance=max(2, sample(15)))
+                    if len(local_max_idx) >= 2:
+                        # Take the two tallest
+                        heights = p_smooth[local_max_idx]
+                        top2 = np.argsort(heights)[-2:]
+                        idx1, idx2 = sorted(local_max_idx[top2])
+
+                        # Notch = minimum between the two peaks
+                        if idx2 > idx1 + 1:
+                            valley = np.min(p_smooth[idx1:idx2+1])
+                            peak_avg = (p_smooth[idx1] + p_smooth[idx2]) / 2
+                            notch_depth = peak_avg - valley
+
+                            # Require notch to be meaningful
+                            if notch_depth > 5 and notch_depth > 0.1 * p_amp[i]:
+                                p_notch_uv[i] = notch_depth
+                                p_notched[i] = True
+                            else:
+                                p_notch_uv[i] = 0
+                        else:
+                            p_notch_uv[i] = 0
+                    else:
+                        p_notch_uv[i] = 0
+
+    # --- T-wave and QT ---
+    t_start_samp = r + sample(T_WINDOW_MS[0])
+    t_end_samp   = r + sample(T_WINDOW_MS[1])
+    if t_start_samp >= 0 and t_end_samp < N:
+        t_seg = ecg[t_start_samp:t_end_samp]
+        t_baseline = np.median(ecg[max(0, r - sample(60)):r - sample(40)])
+
+        t_peak_rel = np.argmax(t_seg)
+        t_amp[i] = t_seg[t_peak_rel] - t_baseline
+
+        # QT: Q-onset to T-end (tangent method)
+        # Q-onset
+        q_onset_offset = 0
+        if r - sample(60) >= 0:
+            pre_r = ecg[r - sample(60):r]
+            q_baseline = np.median(ecg[max(0, r-sample(200)):r-sample(100)])
+            below = np.where(pre_r <= q_baseline)[0]
+            if len(below) > 0:
+                q_onset_offset = sample(60) - below[-1]
+
+        # T-end via tangent
+        t_end_offset = t_peak_rel  # fallback
+        if t_peak_rel + 5 < len(t_seg):
+            post_tpeak = t_seg[t_peak_rel:]
+            slopes = np.diff(post_tpeak)
+            if len(slopes) > 2:
+                steepest = np.argmin(slopes)
+                slope_val = slopes[steepest]
+                if slope_val < -0.5:
+                    y_at = post_tpeak[steepest]
+                    dx = (t_baseline - y_at) / slope_val
+                    t_end_offset = t_peak_rel + steepest + max(0, dx)
+
+        qt_samples = q_onset_offset + sample(T_WINDOW_MS[0]) + t_end_offset
+        qt_ms[i] = qt_samples / FS * 1000
+
+        # Bazett QTc
+        if not np.isnan(rr_ms[i]) and rr_ms[i] > 300:
+            rr_sec = rr_ms[i] / 1000
+            qtc_ms[i] = qt_ms[i] / np.sqrt(rr_sec)
+
+    # --- ST level (J-point + 80ms) ---
+    st_idx = r + sample(ST_MEASURE_MS)
+    if st_idx < N:
+        st_baseline = np.median(ecg[max(0, r - sample(200)):r - sample(100)])
+        st_level[i] = ecg[st_idx] - st_baseline
 
 # =============================================================
-# PRE-COMPUTE HR TIMELINE
+# PVC DETECTION
 # =============================================================
-# R-R based HR for each beat
-hr_bpm = np.full(n_beats, np.nan)
-for i in range(1, n_beats):
-    rr_s = (peaks[i] - peaks[i - 1]) / FS
-    if 0.3 < rr_s < 2.5:
-        hr_bpm[i] = 60.0 / rr_s
+# Extract QRS windows (±100ms around R-peak) for morphology comparison
+qrs_half = sample(100)
+qrs_win_len = 2 * qrs_half + 1
 
-# Gaussian rolling average (sigma=2s, same as analyze_ecg)
-hr_avg = np.full(n_beats, np.nan)
-SIGMA_S = 2.0
-beat_time_s = peaks / FS
-valid_hr = ~np.isnan(hr_bpm)
-valid_idx = np.where(valid_hr)[0]
-if len(valid_idx) > 2:
-    for ii, ci in enumerate(valid_idx):
-        t_c = beat_time_s[ci]
-        lo = ii
-        while lo > 0 and (t_c - beat_time_s[valid_idx[lo - 1]]) < 3 * SIGMA_S:
-            lo -= 1
-        hi = ii
-        while hi < len(valid_idx) - 1 and (beat_time_s[valid_idx[hi + 1]] - t_c) < 3 * SIGMA_S:
-            hi += 1
-        win = valid_idx[lo:hi + 1]
-        dt = beat_time_s[win] - t_c
-        w = np.exp(-0.5 * (dt / SIGMA_S) ** 2)
-        hr_avg[ci] = np.average(hr_bpm[win], weights=w)
-
-print(f"HR timeline: {np.nanmin(hr_avg):.0f}-{np.nanmax(hr_avg):.0f} bpm")
-
-# =============================================================
-# EXTRACT BEAT WINDOWS
-# =============================================================
-pre_samp  = int(PRE_R_MS * FS / 1000)
-post_samp = int(POST_R_MS * FS / 1000)
-win_len   = pre_samp + post_samp + 1
-t_win_ms  = np.arange(-pre_samp, post_samp + 1) / FS * 1000
-
-# Highpass filter for noise metric (removes baseline wander from residual)
-sos_noise_hp = signal.butter(2, 40, 'highpass', fs=FS, output='sos')
-
-def get_beat(beat_idx, data):
-    """Extract a single beat window, zero-padded if at edges."""
+def get_qrs_window(beat_idx):
+    """Extract QRS region around R-peak, NaN-padded if at edges."""
     r = peaks[beat_idx]
-    start = r - pre_samp
-    end = r + post_samp + 1
+    s = r - qrs_half
+    e = r + qrs_half + 1
+    if s < 0 or e > N:
+        return None
+    return ecg[s:e].copy()
 
-    if start < 0 or end > N:
-        beat = np.full(win_len, np.nan)
-        s = max(0, start)
-        e = min(N, end)
-        offset = s - start
-        beat[offset:offset + (e - s)] = data[s:e]
-        return beat
-    return data[start:end].copy()
+# Build template from first 30 beats that have valid R-R and normal-looking amplitude
+template_beats = []
+median_amp = np.nanmedian(qrs_amp)
+for i in range(min(n_beats, 200)):
+    if np.isnan(qrs_amp[i]):
+        continue
+    # Skip obvious outliers for template building
+    if abs(qrs_amp[i] - median_amp) > 0.5 * median_amp:
+        continue
+    win = get_qrs_window(i)
+    if win is not None:
+        template_beats.append(win)
+    if len(template_beats) >= 30:
+        break
 
-def compute_rolling_avg(center_idx, data, window):
-    """Compute average of beats around center_idx."""
-    start = max(0, center_idx - window + 1)
-    end = center_idx + 1
-    beats = []
-    for j in range(start, end):
-        b = get_beat(j, data)
-        if not np.any(np.isnan(b)):
-            beats.append(b)
-    if len(beats) == 0:
-        return np.full(win_len, np.nan)
-    return np.mean(beats, axis=0)
+if len(template_beats) >= 5:
+    qrs_template = np.mean(template_beats, axis=0)
+
+    for i in range(n_beats):
+        win = get_qrs_window(i)
+        if win is None:
+            continue
+
+        # Correlation with template
+        cc = np.corrcoef(win, qrs_template)[0, 1]
+        qrs_corr[i] = cc
+
+        # PVC criteria (any of these flag it):
+        # 1. Low morphology correlation (different shape)
+        morph_abnormal = cc < 0.85
+
+        # 2. QRS significantly wider than normal
+        width_abnormal = (not np.isnan(qrs_dur_ms[i]) and
+                          not np.isnan(np.nanmedian(qrs_dur_ms)) and
+                          qrs_dur_ms[i] > np.nanmedian(qrs_dur_ms) * 1.5)
+
+        # 3. Premature: R-R < 80% of recent median R-R
+        premature = False
+        if i > 2 and not np.isnan(rr_ms[i]):
+            recent_rr = rr_ms[max(1, i-10):i]
+            recent_rr = recent_rr[~np.isnan(recent_rr)]
+            if len(recent_rr) >= 3:
+                premature = rr_ms[i] < 0.80 * np.median(recent_rr)
+
+        # 4. Inverted polarity (big negative QRS where normally positive)
+        inverted = (not np.isnan(qrs_amp[i]) and
+                    median_amp > 200 and
+                    qrs_amp[i] < median_amp * 0.2)
+
+        # Score: sum of weighted criteria
+        score = 0
+        if morph_abnormal:  score += 2
+        if width_abnormal:  score += 1
+        if premature:       score += 1
+        if inverted:        score += 2
+        pvc_score[i] = score
+
+        # Flag as PVC if morphology is clearly abnormal, or multiple criteria
+        is_pvc[i] = morph_abnormal or score >= 3
+
+    n_pvc = np.sum(is_pvc)
+    pvc_burden = 100 * n_pvc / n_beats if n_beats > 0 else 0
+    print(f"PVCs detected: {n_pvc}/{n_beats} ({pvc_burden:.1f}%)")
+else:
+    print("Warning: insufficient beats for PVC template")
 
 # =============================================================
-# INTERACTIVE PLOT
+# ARTIFACT / OUTLIER REJECTION
 # =============================================================
-PERSIST_DEPTH = 20  # number of historical beats to show in persistence mode
+# Flag beats where key metrics deviate wildly from local rolling median.
+# Uses MAD (median absolute deviation) which is robust to the outliers
+# themselves. Flagged beats are kept in arrays but excluded from
+# summary stats and plotted as gray.
 
-class BeatScope:
-    def __init__(self):
-        self.idx = 0
-        self.avg_window = AVG_WINDOW_DEFAULT
-        self.show_ghost = True
-        self.show_persist = False  # storage scope persistence
-        self.show_avg = True
-        self.show_pwave = True
-        self.use_filter = True
-        self.num_beats = 1
-        self.data = ecg_filtered
-        self._dragging = False
-        self.tl_mode = 'hr'          # 'hr' or 'noise'
-        self._noise_timeline = None   # lazy-computed
+OUTLIER_WINDOW = 51   # beats for rolling median (odd number)
+OUTLIER_THRESH = 5.0  # multiples of MAD
 
-        # --- Layout: beat scope on top, timeline strip on bottom ---
-        self.fig = plt.figure(figsize=(14, 7))
-        gs = GridSpec(2, 1, height_ratios=[5, 1], hspace=0.25,
-                      left=0.06, right=0.98, top=0.94, bottom=0.06)
-        self.ax = self.fig.add_subplot(gs[0])
-        self.ax_tl = self.fig.add_subplot(gs[1])
-        self.fig.canvas.manager.set_window_title('ECG Beat Scope')
+is_artifact = np.full(n_beats, False)
 
-        # --- Timeline strip ---
-        self._draw_timeline()
+def rolling_median_mad(arr, window):
+    """Compute rolling median and MAD for an array with NaNs."""
+    half = window // 2
+    med = np.full_like(arr, np.nan)
+    mad = np.full_like(arr, np.nan)
+    for i in range(len(arr)):
+        s = max(0, i - half)
+        e = min(len(arr), i + half + 1)
+        chunk = arr[s:e]
+        valid = chunk[~np.isnan(chunk)]
+        if len(valid) >= 5:
+            m = np.median(valid)
+            med[i] = m
+            mad[i] = np.median(np.abs(valid - m))
+    return med, mad
 
-        # Position marker on timeline
-        self.tl_marker = self.ax_tl.axvline(beat_mpl[0], color='red',
-                                             linewidth=1.5, alpha=0.8)
+# Check each key metric for outliers
+metrics_to_check = [
+    ("QRS amp",  qrs_amp),
+    ("R-R",      rr_ms),
+    ("P-wave",   p_amp),
+    ("T-wave",   t_amp),
+    ("QTc",      qtc_ms),
+    ("ST level", st_level),
+]
 
-        # --- Beat scope (main axes) ---
-        # Persistence traces
-        self.persist_lines = []
-        for k in range(PERSIST_DEPTH):
-            alpha = 0.04 + 0.16 * (k / max(1, PERSIST_DEPTH - 1))
-            ln, = self.ax.plot([], [], color='green', linewidth=0.6,
-                               alpha=alpha)
-            self.persist_lines.append(ln)
+for name, arr in metrics_to_check:
+    med, mad = rolling_median_mad(arr, OUTLIER_WINDOW)
+    for i in range(n_beats):
+        if np.isnan(arr[i]) or np.isnan(med[i]) or np.isnan(mad[i]):
+            continue
+        # MAD=0 happens if signal is very stable; use a small floor
+        effective_mad = max(mad[i], 1.0)
+        if abs(arr[i] - med[i]) > OUTLIER_THRESH * effective_mad:
+            is_artifact[i] = True
 
-        # Plot elements
-        self.line_curr, = self.ax.plot([], [], 'b-', linewidth=1.5,
-                                        label='Current beat')
-        self.line_ghost, = self.ax.plot([], [], color='steelblue',
-                                         linewidth=0.8, alpha=0.3,
-                                         label='Previous beat')
-        self.line_avg, = self.ax.plot([], [], 'r--', linewidth=1.2,
-                                       alpha=0.6,
-                                       label=f'Avg (last {self.avg_window})')
+# Don't flag PVCs as artifacts — they're real beats, just abnormal
+is_artifact = is_artifact & ~is_pvc
 
-        # R-peak marker
-        self.r_marker, = self.ax.plot([], [], 'rv', markersize=8)
+n_artifact = np.sum(is_artifact)
+print(f"Artifact beats: {n_artifact}/{n_beats} ({100*n_artifact/max(1,n_beats):.1f}%)")
 
-        # P-wave region highlight
-        p_start_ms = -P_REGION_MS[0]
-        p_width_ms = P_REGION_MS[0] - P_REGION_MS[1]
-        self.p_rect = Rectangle((p_start_ms, 0), p_width_ms, 1,
-                                 alpha=0.08, color='orange',
-                                 transform=self.ax.get_xaxis_transform())
-        self.ax.add_patch(self.p_rect)
+# Create a "clean" mask: not artifact, not PVC
+is_clean = ~is_artifact & ~is_pvc
 
-        # Vertical line at R=0
-        self.ax.axvline(0, color='gray', linestyle=':', linewidth=0.5,
-                         alpha=0.5)
-        # Baseline
-        self.ax.axhline(0, color='gray', linestyle='-', linewidth=0.3,
-                         alpha=0.3)
+# =============================================================
+# HRV METRICS (rolling window)
+# =============================================================
+sdnn  = np.full(n_beats, np.nan)
+rmssd = np.full(n_beats, np.nan)
+W = HRV_WINDOW_BEATS
 
-        self.ax.set_xlim(-PRE_R_MS, POST_R_MS)
-        self.ax.set_xlabel('Time relative to R-peak (ms)')
-        self.ax.set_ylabel('µV')
-        self.ax.grid(True, alpha=0.2)
-        self.ax.legend(loc='upper right', fontsize=8)
+for i in range(W, n_beats):
+    rr_win = rr_ms[i-W+1:i+1]
+    clean_win = is_clean[i-W+1:i+1]
+    valid = rr_win[~np.isnan(rr_win) & clean_win]
+    if len(valid) >= W // 2:
+        sdnn[i] = np.std(valid)
+        diffs = np.diff(valid)
+        rmssd[i] = np.sqrt(np.mean(diffs**2)) if len(diffs) > 0 else np.nan
 
-        self.title = self.ax.set_title('', fontsize=11)
-        self.status_text = self.ax.text(
-            0.01, 0.01, '', transform=self.ax.transAxes,
-            fontsize=8, verticalalignment='bottom',
-            fontfamily='monospace', color='gray')
+# =============================================================
+# RESPIRATORY SINUS ARRHYTHMIA (RSA) — from R-R modulation
+# =============================================================
+# Interpolate R-R to uniform time grid, then bandpass 0.1-0.5 Hz
+valid_rr = ~np.isnan(rr_ms) & is_clean
+if np.sum(valid_rr) > 10:
+    rr_interp_t = np.arange(beat_time[1], beat_time[-1], 1.0/4)  # 4 Hz grid
+    rr_interp = np.interp(rr_interp_t, beat_time[valid_rr], rr_ms[valid_rr])
 
-        # Connect events
-        self.fig.canvas.mpl_connect('key_press_event', self.on_key)
-        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-        self.fig.canvas.mpl_connect('button_release_event', self.on_release)
-        self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
-        self.fig.canvas.mpl_connect('scroll_event', self.on_scroll)
+    # Clip outliers before bandpassing to prevent ringing artifacts
+    rr_med = np.median(rr_interp)
+    rr_mad = np.median(np.abs(rr_interp - rr_med))
+    clip_limit = 5 * max(rr_mad, 1.0)
+    rr_interp = np.clip(rr_interp, rr_med - clip_limit, rr_med + clip_limit)
 
-        # Store full timeline range for zoom reset
-        self._tl_full_xlim = self.ax_tl.get_xlim()
-        self._panning = False
-        self._pan_origin = None
+    # Median filter to remove isolated spikes that survived clipping
+    from scipy.signal import medfilt
+    rr_interp = medfilt(rr_interp, kernel_size=7)
 
-        self.update()
+    sos_rsa = signal.butter(2, [0.1, 0.5], 'bandpass', fs=4, output='sos')
+    rsa_signal = signal.sosfiltfilt(sos_rsa, rr_interp)
+    rsa_envelope = np.abs(signal.hilbert(rsa_signal))
+else:
+    rr_interp_t = np.array([])
+    rsa_signal = np.array([])
+    rsa_envelope = np.array([])
 
-    def _compute_noise_timeline(self):
-        """Lazy-compute per-beat noise RMS (HP-filtered residual vs rolling avg)."""
-        if self._noise_timeline is not None:
-            return self._noise_timeline
-        print("Computing noise timeline...", end=' ', flush=True)
-        noise = np.full(n_beats, np.nan)
-        for i in range(1, n_beats):
-            b = get_beat(i, ecg_filtered)
-            avg = compute_rolling_avg(i, ecg_filtered, self.avg_window)
-            if np.any(np.isnan(b)) or np.any(np.isnan(avg)):
-                continue
-            residual = b - avg
-            residual_hp = signal.sosfilt(sos_noise_hp, residual)
-            noise[i] = np.sqrt(np.mean(residual_hp ** 2))
-        self._noise_timeline = noise
-        v = ~np.isnan(noise)
-        print(f"done ({np.sum(v)} beats, "
-              f"median {np.nanmedian(noise):.0f} µV)")
-        return noise
+# =============================================================
+# ROLLING HEART RATE AVERAGE (Gaussian-weighted, σ=5s)
+# =============================================================
+HR_AVG_SIGMA_SEC = 2.0     # Gaussian σ (effective ~6s window at ±1.5σ)
+HR_AVG_CUTOFF = 3.0        # evaluate out to ±3σ
+hr_avg = np.full(n_beats, np.nan)
+clean_hr = ~np.isnan(hr_bpm) & ~is_pvc  # include artifact beats (valid timing)
 
-    def _draw_timeline(self):
-        """Clear and redraw the timeline strip for current mode."""
-        xlim = self.ax_tl.get_xlim()
-        has_marker = hasattr(self, 'tl_marker')
-        self.ax_tl.clear()
+clean_idx = np.where(clean_hr)[0]
+if len(clean_idx) >= 3:
+    clean_times = beat_time[clean_idx]
+    clean_vals = hr_bpm[clean_idx]
+    half_win = HR_AVG_SIGMA_SEC * HR_AVG_CUTOFF
+    lo = 0
+    for ci in range(len(clean_idx)):
+        t_center = clean_times[ci]
+        while lo < ci and clean_times[lo] < t_center - half_win:
+            lo += 1
+        hi = ci
+        while hi < len(clean_idx) - 1 and clean_times[hi + 1] <= t_center + half_win:
+            hi += 1
+        if hi - lo + 1 >= 3:
+            dt = clean_times[lo:hi + 1] - t_center
+            weights = np.exp(-0.5 * (dt / HR_AVG_SIGMA_SEC) ** 2)
+            hr_avg[clean_idx[ci]] = np.average(clean_vals[lo:hi + 1], weights=weights)
 
-        if self.tl_mode == 'noise':
-            noise = self._compute_noise_timeline()
-            v = ~np.isnan(noise)
-            # Raw per-beat trace (dim)
-            self.ax_tl.plot(beat_mpl[v], noise[v], color='purple',
-                            linewidth=0.4, alpha=0.25)
-            # Rolling median trendline
-            if np.sum(v) > 30:
-                noise_valid = noise[v]
-                mpl_valid = beat_mpl[v]
-                smoothed = median_filter(noise_valid, size=31)
-                self.ax_tl.plot(mpl_valid, smoothed, color='purple',
-                                linewidth=1.2, alpha=0.9)
-            self.ax_tl.set_ylabel('µV', fontsize=8)
-            if np.any(v):
-                self.ax_tl.set_ylim(0, np.nanpercentile(noise[v], 99) * 1.2)
-        else:
-            v = ~np.isnan(hr_avg)
-            self.ax_tl.plot(beat_mpl[v], hr_avg[v], color='navy',
-                            linewidth=1.0, alpha=0.8)
-            self.ax_tl.set_ylabel('bpm', fontsize=8)
-            if np.any(v):
-                ylo = max(30, np.nanmin(hr_avg[v]) - 5)
-                yhi = np.nanmax(hr_avg[v]) + 5
-                self.ax_tl.set_ylim(ylo, yhi)
+# =============================================================
+# PLOT DASHBOARD
+# =============================================================
+stem = str(Path(CSV_FILE).parent / Path(CSV_FILE).stem)
+title_base = f"{Path(CSV_FILE).name}  ({FS} sps, {N/FS:.0f}s)"
 
-        self.ax_tl.grid(True, alpha=0.2)
-        self.ax_tl.tick_params(labelsize=7)
+def plot_metric(ax, x, y, ylabel, title, color='steelblue', scatter=False):
+    valid = ~np.isnan(y)
+    clean = valid & is_clean
+    dirty = valid & is_artifact
+    if scatter:
+        if np.any(dirty):
+            ax.scatter(x[dirty], y[dirty], s=3, c='silver', alpha=0.7, zorder=1)
+        ax.scatter(x[clean], y[clean], s=4, c=color, alpha=0.6, zorder=2)
+    else:
+        ax.plot(x[valid], y[valid], color=color, linewidth=0.8, alpha=0.8)
+    ax.set_ylabel(ylabel, fontsize=9)
+    ax.set_title(title, fontsize=10, loc='left')
+    ax.grid(True, alpha=0.3)
 
-        # Time axis formatting
-        if time_source != 'elapsed':
-            self.ax_tl.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-            self.ax_tl.xaxis.set_major_locator(
-                mdates.AutoDateLocator(minticks=6, maxticks=15))
-            self.ax_tl.fmt_xdata = mdates.DateFormatter('%H:%M:%S')
-        else:
-            self.ax_tl.set_xlabel('Elapsed (min)', fontsize=8)
+if args.plot == 'hr':
+    # ----- HR-only plot -----
+    fig_hr, ax_hr = plt.subplots(1, 1, figsize=(16, 4))
+    fig_hr.suptitle(f"Heart Rate — {title_base}", fontsize=12, fontweight='bold')
 
-        # Restore x limits if we had them
-        if has_marker and xlim[0] != xlim[1]:
-            self.ax_tl.set_xlim(xlim)
+    valid_hr = ~np.isnan(hr_bpm)
+    clean_hr_mask = valid_hr & is_clean
+    dirty_hr_mask = valid_hr & is_artifact
 
-        # Re-add position marker
-        self.tl_marker = self.ax_tl.axvline(beat_mpl[self.idx], color='red',
-                                             linewidth=1.5, alpha=0.8)
+    if np.any(dirty_hr_mask):
+        ax_hr.scatter(beat_wall[dirty_hr_mask], hr_bpm[dirty_hr_mask], s=3,
+                      c='silver', alpha=0.7, zorder=1, label='Artifact')
+    ax_hr.scatter(beat_wall[clean_hr_mask], hr_bpm[clean_hr_mask], s=4,
+                  c='crimson', alpha=0.6, zorder=2, label='Heart Rate')
 
-    def _mpl_to_beat_idx(self, x_mpl):
-        """Find nearest beat index to an x position on the timeline."""
-        dists = np.abs(beat_mpl - x_mpl)
-        return int(np.argmin(dists))
+    # Rolling average
+    valid_avg = ~np.isnan(hr_avg)
+    if np.any(valid_avg):
+        ax_hr.plot(beat_wall[valid_avg], hr_avg[valid_avg], color='navy',
+                   linewidth=1.5, alpha=0.7, zorder=3, label=f'avg (σ={HR_AVG_SIGMA_SEC:.0f}s)')
 
-    def _reset_tl_zoom(self):
-        """Reset timeline to full view."""
-        self.ax_tl.set_xlim(self._tl_full_xlim)
-        self.fig.canvas.draw_idle()
+    ax_hr.set_ylabel('bpm', fontsize=9)
+    ax_hr.set_title('Heart Rate', fontsize=10, loc='left')
+    ax_hr.legend(fontsize=8, loc='upper right')
+    ax_hr.grid(True, alpha=0.3)
+    format_time_axis(ax_hr)
+    fig_hr.tight_layout()
+    fig_hr.savefig(f"{stem}_hr.png", dpi=150, bbox_inches='tight')
+    print(f"Saved {stem}_hr.png")
 
-    def on_click(self, event):
-        if event.inaxes != self.ax_tl:
-            return
-        # Double-click: reset zoom
-        if event.dblclick:
-            self._reset_tl_zoom()
-            return
-        # Left-click: scrub
-        if event.button == 1:
-            self._dragging = True
-            idx = self._mpl_to_beat_idx(event.xdata)
-            self.goto(idx)
-        # Right-click: start pan
-        elif event.button == 3:
-            self._panning = True
-            self._pan_origin = event.xdata
+else:
+    # ----- Figure 1: ECG trace + Heart Rate + R-R + HRV -----
+    fig1, axes1 = plt.subplots(4, 1, figsize=(16, 10), sharex=True)
+    fig1.suptitle(f"Rhythm & Rate — {title_base}", fontsize=12, fontweight='bold')
 
-    def on_release(self, event):
-        self._dragging = False
-        self._panning = False
-        self._pan_origin = None
+    ax = axes1[0]
+    ax.plot(t_wall, ecg, linewidth=0.3, color='steelblue')
+    ax.plot(t_wall[peaks], ecg[peaks], 'r.', markersize=2)
+    ax.set_ylabel('µV')
+    ax.set_title('Filtered ECG with detected R-peaks', fontsize=10, loc='left')
+    ax.grid(True, alpha=0.3)
 
-    def on_motion(self, event):
-        if event.inaxes != self.ax_tl:
-            return
-        # Left-drag: scrub
-        if self._dragging:
-            idx = self._mpl_to_beat_idx(event.xdata)
-            self.goto(idx)
-        # Right-drag: pan
-        elif self._panning and self._pan_origin is not None:
-            dx = self._pan_origin - event.xdata
-            lo, hi = self.ax_tl.get_xlim()
-            full_lo, full_hi = self._tl_full_xlim
-            new_lo = lo + dx
-            new_hi = hi + dx
-            # Clamp to full range
-            if new_lo < full_lo:
-                new_lo, new_hi = full_lo, full_lo + (hi - lo)
-            if new_hi > full_hi:
-                new_hi, new_lo = full_hi, full_hi - (hi - lo)
-            self.ax_tl.set_xlim(new_lo, new_hi)
-            self._pan_origin = event.xdata
-            self.fig.canvas.draw_idle()
+    plot_metric(axes1[1], beat_wall, hr_bpm, 'bpm', 'Heart Rate',
+                color='crimson', scatter=True)
+    valid_avg = ~np.isnan(hr_avg)
+    if np.any(valid_avg):
+        axes1[1].plot(beat_wall[valid_avg], hr_avg[valid_avg], color='navy',
+                      linewidth=1.5, alpha=0.7, zorder=3)
 
-    def on_scroll(self, event):
-        if event.inaxes != self.ax_tl:
-            return
-        lo, hi = self.ax_tl.get_xlim()
-        full_span = self._tl_full_xlim[1] - self._tl_full_xlim[0]
-        span = hi - lo
+    ax = axes1[2]
+    normal_rr = is_clean & ~np.isnan(rr_ms)
+    artifact_rr = is_artifact & ~np.isnan(rr_ms)
+    pvc_rr = is_pvc & ~np.isnan(rr_ms)
+    if np.any(artifact_rr):
+        ax.scatter(beat_wall[artifact_rr], rr_ms[artifact_rr], s=3, c='lightgray',
+                   alpha=0.4, zorder=1)
+    ax.scatter(beat_wall[normal_rr], rr_ms[normal_rr], s=4, c='darkgreen', alpha=0.6,
+               zorder=2)
+    if np.any(pvc_rr):
+        ax.scatter(beat_wall[pvc_rr], rr_ms[pvc_rr], s=20, c='red', marker='x',
+                   linewidths=1.5, zorder=5, label='PVC')
+        ax.legend(fontsize=8)
+    ax.set_ylabel('ms', fontsize=9)
+    ax.set_title('R-R Interval', fontsize=10, loc='left')
+    ax.grid(True, alpha=0.3)
 
-        # Zoom factor per scroll step
-        factor = 0.8 if event.button == 'up' else 1.25
+    ax = axes1[3]
+    v = ~np.isnan(sdnn)
+    ax.plot(beat_wall[v], sdnn[v], color='purple', linewidth=1, label='SDNN', alpha=0.8)
+    v = ~np.isnan(rmssd)
+    ax.plot(beat_wall[v], rmssd[v], color='orange', linewidth=1, label='RMSSD', alpha=0.8)
+    ax.set_ylabel('ms')
+    ax.set_title(f'HRV (rolling {W}-beat window)', fontsize=10, loc='left')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    format_time_axis(axes1[3])
 
-        new_span = span * factor
-        # Clamp: don't zoom out beyond full range, don't zoom in beyond 1/500th
-        new_span = max(full_span / 500, min(full_span, new_span))
+    fig1.tight_layout()
+    fig1.savefig(f"{stem}_1_rhythm.png", dpi=150, bbox_inches='tight')
 
-        # Zoom centered on cursor position
-        cursor = event.xdata
-        frac = (cursor - lo) / span if span > 0 else 0.5
-        new_lo = cursor - frac * new_span
-        new_hi = cursor + (1 - frac) * new_span
+    # ----- Figure 2: QRS amplitude + duration + correlation + PVC + ST level -----
+    fig2, axes2 = plt.subplots(5, 1, figsize=(16, 13), sharex=True)
+    fig2.suptitle(f"QRS & ST Morphology — {title_base}", fontsize=12, fontweight='bold')
 
-        # Clamp to full range
-        full_lo, full_hi = self._tl_full_xlim
-        if new_lo < full_lo:
-            new_lo, new_hi = full_lo, full_lo + new_span
-        if new_hi > full_hi:
-            new_hi, new_lo = full_hi, full_hi - new_span
+    ax = axes2[0]
+    normal = is_clean
+    artifact = is_artifact & ~np.isnan(qrs_amp)
+    if np.any(artifact):
+        ax.scatter(beat_wall[artifact], qrs_amp[artifact], s=3, c='lightgray',
+                   alpha=0.4, zorder=1)
+    ax.scatter(beat_wall[normal], qrs_amp[normal], s=4, c='steelblue', alpha=0.6,
+               zorder=2)
+    if np.any(is_pvc):
+        ax.scatter(beat_wall[is_pvc], qrs_amp[is_pvc], s=20, c='red', marker='x',
+                   linewidths=1.5, zorder=5, label=f'PVC ({np.sum(is_pvc)})')
+        ax.legend(fontsize=8)
+    ax.set_ylabel('µV', fontsize=9)
+    ax.set_title('QRS Amplitude (R-peak) — red × = PVC', fontsize=10, loc='left')
+    ax.grid(True, alpha=0.3)
 
-        self.ax_tl.set_xlim(new_lo, new_hi)
-        self.fig.canvas.draw_idle()
+    plot_metric(axes2[1], beat_wall, qrs_dur_ms, 'ms', 'QRS Duration',
+                color='teal', scatter=True)
 
-    def update(self):
-        # Determine how many beats we can actually show
-        last_beat = min(self.idx + self.num_beats - 1, n_beats - 1)
-        actual_beats = last_beat - self.idx + 1
-        single = (actual_beats == 1)
+    ax = axes2[2]
+    valid_cc = ~np.isnan(qrs_corr)
+    colors = np.where(is_pvc[valid_cc], 'red', 'steelblue')
+    ax.scatter(beat_wall[valid_cc], qrs_corr[valid_cc], s=4, c=colors, alpha=0.6)
+    ax.axhline(0.85, color='orange', linestyle='--', linewidth=0.8, alpha=0.5,
+               label='PVC threshold')
+    ax.set_ylabel('r', fontsize=9)
+    ax.set_title('QRS Morphology Correlation with Template', fontsize=10, loc='left')
+    ax.set_ylim(min(0.4, np.nanmin(qrs_corr) - 0.05) if np.any(valid_cc) else 0.4,
+                1.02)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
-        if single:
-            beat = get_beat(self.idx, self.data)
-            t_ms = t_win_ms
-        else:
-            start = peaks[self.idx] - pre_samp
-            end = peaks[last_beat] + post_samp + 1
-            win_n = end - start
-            beat = np.full(win_n, np.nan)
-            s = max(0, start)
-            e = min(N, end)
-            offset = s - start
-            beat[offset:offset + (e - s)] = self.data[s:e]
-            t_ms = np.arange(win_n) / FS * 1000 - PRE_R_MS
+    ax = axes2[3]
+    valid_sc = ~np.isnan(pvc_score)
+    colors_sc = np.where(is_pvc[valid_sc], 'red', 'gray')
+    ax.scatter(beat_wall[valid_sc], pvc_score[valid_sc], s=6, c=colors_sc, alpha=0.6)
+    ax.set_ylabel('score', fontsize=9)
+    ax.set_title('PVC Score (≥3 or morph abnormal → PVC)', fontsize=10, loc='left')
+    ax.grid(True, alpha=0.3)
 
-        self.line_curr.set_data(t_ms, beat)
+    plot_metric(axes2[4], beat_wall, st_level, 'µV', 'ST Level (J+80ms)',
+                color='brown', scatter=True)
+    axes2[4].axhline(0, color='gray', linestyle='-', linewidth=0.5)
+    format_time_axis(axes2[4])
 
-        # Ghost
-        if self.show_ghost and self.idx > 0 and single:
-            ghost = get_beat(self.idx - 1, self.data)
-            self.line_ghost.set_data(t_win_ms, ghost)
-            self.line_ghost.set_visible(True)
-        else:
-            self.line_ghost.set_visible(False)
+    fig2.tight_layout()
+    fig2.savefig(f"{stem}_2_qrs_st.png", dpi=150, bbox_inches='tight')
 
-        # Persistence
-        for k, ln in enumerate(self.persist_lines):
-            hist_idx = self.idx - PERSIST_DEPTH + k
-            if self.show_persist and single and 0 <= hist_idx < self.idx:
-                b = get_beat(hist_idx, self.data)
-                ln.set_data(t_win_ms, b)
-                ln.set_visible(True)
-            else:
-                ln.set_visible(False)
+    # ----- Figure 3: P-wave amplitude + notch + T-wave + QTc -----
+    fig3, axes3 = plt.subplots(4, 1, figsize=(16, 10), sharex=True)
+    fig3.suptitle(f"P-wave, T-wave & QTc — {title_base}", fontsize=12, fontweight='bold')
 
-        # Rolling average
-        avg_beat = None
-        if self.show_avg and self.idx >= 1 and single:
-            avg_beat = compute_rolling_avg(self.idx, self.data, self.avg_window)
-            self.line_avg.set_data(t_win_ms, avg_beat)
-            self.line_avg.set_visible(True)
-            self.line_avg.set_label(f'Avg (last {self.avg_window})')
-        else:
-            self.line_avg.set_visible(False)
+    plot_metric(axes3[0], beat_wall, p_amp, 'µV', 'P-wave Amplitude',
+                color='darkorange', scatter=True)
 
-        # R-peak markers
-        r_times = []
-        r_amps = []
-        for bi in range(self.idx, last_beat + 1):
-            t_r = (peaks[bi] - peaks[self.idx]) / FS * 1000
-            if single:
-                amp = beat[pre_samp] if not np.isnan(beat[pre_samp]) else 0
-            else:
-                si = peaks[bi] - (peaks[self.idx] - pre_samp)
-                amp = beat[si] if 0 <= si < len(beat) and not np.isnan(beat[si]) else 0
-            r_times.append(t_r)
-            r_amps.append(amp)
-        self.r_marker.set_data(r_times, r_amps)
+    ax = axes3[1]
+    valid_notch = ~np.isnan(p_notch_uv)
+    ax.scatter(beat_wall[valid_notch], p_notch_uv[valid_notch], s=6,
+               c=np.where(p_notched[valid_notch], 'red', 'gray'), alpha=0.6)
+    ax.set_ylabel('µV')
+    ax.set_title('P-wave Notch Depth (red = notch detected)', fontsize=10, loc='left')
+    ax.grid(True, alpha=0.3)
 
-        # P-wave highlight
-        self.p_rect.set_visible(self.show_pwave and single)
+    plot_metric(axes3[2], beat_wall, t_amp, 'µV', 'T-wave Amplitude',
+                color='green', scatter=True)
 
-        # Axis limits
-        self.ax.set_xlim(t_ms[0], t_ms[-1])
+    plot_metric(axes3[3], beat_wall, qtc_ms, 'ms', 'QTc (Bazett)',
+                color='darkred', scatter=True)
+    axes3[3].axhline(350, color='orange', linestyle='--', linewidth=0.8, alpha=0.5)
+    axes3[3].axhline(450, color='orange', linestyle='--', linewidth=0.8, alpha=0.5)
+    format_time_axis(axes3[3])
 
-        valid = beat[~np.isnan(beat)]
-        if len(valid) > 0:
-            ymin, ymax = np.min(valid), np.max(valid)
-            margin = (ymax - ymin) * 0.15
-            self.ax.set_ylim(ymin - margin, ymax + margin)
+    fig3.tight_layout()
+    fig3.savefig(f"{stem}_3_pt_waves.png", dpi=150, bbox_inches='tight')
 
-        # --- Timeline position marker ---
-        self.tl_marker.set_xdata([beat_mpl[self.idx], beat_mpl[self.idx]])
+    # ----- Figure 4: Respiratory Sinus Arrhythmia -----
+    fig4, ax4 = plt.subplots(1, 1, figsize=(16, 4))
+    fig4.suptitle(f"Respiratory Sinus Arrhythmia — {title_base}",
+                  fontsize=12, fontweight='bold')
 
-        # --- Title with wall-clock time ---
-        r_time = peaks[self.idx] / FS
-        rr_ms = ''
-        hr = ''
-        if self.idx > 0:
-            rr = (peaks[self.idx] - peaks[self.idx - 1]) / FS * 1000
-            rr_ms = f'{rr:.0f}'
-            hr = f'{60000/rr:.1f}'
+    if len(rr_interp_t) > 0:
+        rsa_epoch = sample_to_epoch(rr_interp_t * FS)  # rr_interp_t is in seconds
+        rsa_wall = epoch_to_mpl(rsa_epoch)
+        ax4.plot(rsa_wall, rsa_signal, color='teal', linewidth=0.6, alpha=0.6,
+                 label='RSA')
+        ax4.plot(rsa_wall, rsa_envelope, color='red', linewidth=1, alpha=0.8,
+                 label='Envelope')
+        ax4.legend(fontsize=8)
+    ax4.set_ylabel('ms')
+    ax4.set_title('R-R modulation bandpassed 0.1–0.5 Hz', fontsize=10, loc='left')
+    ax4.grid(True, alpha=0.3)
+    format_time_axis(ax4)
 
-        r_amp = r_amps[0] if r_amps else 0
+    fig4.tight_layout()
+    fig4.savefig(f"{stem}_4_rsa.png", dpi=150, bbox_inches='tight')
 
-        # Noise metric: RMS of highpass-filtered (current beat − rolling average)
-        # Highpass removes slow baseline wander; keeps HF texture noise
-        noise_str = ''
-        if single and avg_beat is not None:
-            residual = beat - avg_beat
-            if not np.any(np.isnan(residual)):
-                residual_hp = signal.sosfilt(sos_noise_hp, residual)
-                noise_rms = np.sqrt(np.mean(residual_hp ** 2))
-                noise_str = f'  Noise: {noise_rms:.0f}\u00b5V'
+    print(f"Saved {stem}_1_rhythm.png")
+    print(f"Saved {stem}_2_qrs_st.png")
+    print(f"Saved {stem}_3_pt_waves.png")
+    print(f"Saved {stem}_4_rsa.png")
 
-        # Wall-clock string
-        if time_source != 'elapsed':
-            wall_str = datetime.fromtimestamp(
-                beat_epoch[self.idx]).strftime('%H:%M:%S')
-        else:
-            m, s = divmod(r_time, 60)
-            wall_str = f'{int(m)}:{s:05.2f}'
+if not args.no_plot:
+    plt.show()
 
-        if single:
-            beat_label = f'Beat {self.idx + 1}/{n_beats}'
-        else:
-            beat_label = f'Beats {self.idx + 1}\u2013{last_beat + 1}/{n_beats}'
+# =============================================================
+# CSV EXPORT (per-beat metrics)
+# =============================================================
+if args.csv_out:
+    import csv as csvmod
+    csv_out_path = f"{stem}_beats.csv"
+    with open(csv_out_path, 'w', newline='') as f:
+        writer = csvmod.writer(f)
+        # Header comment with metadata
+        f.write(f"# source: {Path(CSV_FILE).name}\n")
+        f.write(f"# sample_rate: {FS}\n")
+        f.write(f"# time_source: {time_source}\n")
+        writer.writerow([
+            'epoch_s', 'sample_idx', 'hr_bpm', 'hr_avg_bpm', 'rr_ms',
+            'qrs_amp_uv', 'qrs_dur_ms', 'p_amp_uv', 'p_dur_ms',
+            't_amp_uv', 'qt_ms', 'qtc_ms', 'st_level_uv',
+            'is_artifact', 'is_pvc', 'qrs_corr', 'pvc_score'
+        ])
+        for i in range(n_beats):
+            writer.writerow([
+                f"{beat_epoch[i]:.6f}",
+                int(peaks[i]),
+                f"{hr_bpm[i]:.1f}" if not np.isnan(hr_bpm[i]) else '',
+                f"{hr_avg[i]:.1f}" if not np.isnan(hr_avg[i]) else '',
+                f"{rr_ms[i]:.1f}" if not np.isnan(rr_ms[i]) else '',
+                f"{qrs_amp[i]:.1f}" if not np.isnan(qrs_amp[i]) else '',
+                f"{qrs_dur_ms[i]:.1f}" if not np.isnan(qrs_dur_ms[i]) else '',
+                f"{p_amp[i]:.1f}" if not np.isnan(p_amp[i]) else '',
+                f"{p_dur_ms[i]:.1f}" if not np.isnan(p_dur_ms[i]) else '',
+                f"{t_amp[i]:.1f}" if not np.isnan(t_amp[i]) else '',
+                f"{qt_ms[i]:.1f}" if not np.isnan(qt_ms[i]) else '',
+                f"{qtc_ms[i]:.1f}" if not np.isnan(qtc_ms[i]) else '',
+                f"{st_level[i]:.1f}" if not np.isnan(st_level[i]) else '',
+                int(is_artifact[i]),
+                int(is_pvc[i]),
+                f"{qrs_corr[i]:.3f}" if not np.isnan(qrs_corr[i]) else '',
+                f"{pvc_score[i]:.0f}" if not np.isnan(pvc_score[i]) else '',
+            ])
+    print(f"Saved {csv_out_path}")
 
-        self.title.set_text(
-            f'{beat_label}  '
-            f'{wall_str}  '
-            f'R-R: {rr_ms}ms  HR: {hr}bpm  '
-            f'QRS: {r_amp:.0f}\u00b5V'
-            f'{noise_str}'
-        )
+# =============================================================
+# SUMMARY STATS
+# =============================================================
+print("\n" + "="*60)
+print("SUMMARY")
+print("="*60)
 
-        flags = []
-        if self.use_filter:   flags.append('FILT')
-        if single and self.show_ghost:   flags.append('GHOST')
-        if single and self.show_persist: flags.append(f'PERSIST:{PERSIST_DEPTH}')
-        if single and self.show_avg:     flags.append(f'AVG:{self.avg_window}')
-        if single and self.show_pwave:   flags.append('P-HL')
-        if not single: flags.append(f'BEATS:{actual_beats}')
-        flags.append(f'TL:{self.tl_mode.upper()}')
-        self.status_text.set_text(
-            f'[{"  ".join(flags)}]  '
-            f'\u2190\u2192:step  Shift:\u00d710  '
-            f'G:ghost  T:persist  R:avg  \u2191\u2193:N  F:filter  P:highlight  N:timeline  1-3:beats  S:save  Q:quit'
-        )
+def stat_line(name, arr, unit='', mask=None):
+    if mask is None:
+        mask = is_clean[:len(arr)] if len(arr) == n_beats else np.ones(len(arr), dtype=bool)
+    v = arr[~np.isnan(arr) & mask[:len(arr)]]
+    if len(v) > 0:
+        print(f"  {name:25s}: {np.mean(v):7.1f} ± {np.std(v):5.1f} {unit}"
+              f"  [{np.min(v):.1f} – {np.max(v):.1f}]")
 
-        self.ax.legend(loc='upper right', fontsize=8)
-        self.fig.canvas.draw_idle()
+stat_line("Heart Rate", hr_bpm, "bpm")
+stat_line("R-R Interval", rr_ms, "ms")
+stat_line("QRS Amplitude", qrs_amp, "µV")
+stat_line("QRS Duration", qrs_dur_ms, "ms")
+stat_line("P-wave Amplitude", p_amp, "µV")
+stat_line("P-wave Duration", p_dur_ms, "ms")
+stat_line("P-wave Notch Depth", p_notch_uv[p_notched], "µV",
+          mask=is_clean[p_notched])
+stat_line("T-wave Amplitude", t_amp, "µV")
+stat_line("QT Interval", qt_ms, "ms")
+stat_line("QTc (Bazett)", qtc_ms, "ms")
+qtc_clean = qtc_ms[~np.isnan(qtc_ms) & is_clean]
+if len(qtc_clean) > 0:
+    p5, p95 = np.percentile(qtc_clean, [5, 95])
+    print(f"  {'QTc 5th–95th %ile':25s}: {p5:7.1f} – {p95:.1f} ms")
+stat_line("ST Level (J+80)", st_level, "µV")
+stat_line("SDNN", sdnn, "ms", mask=np.ones(n_beats, dtype=bool))
+stat_line("RMSSD", rmssd, "ms", mask=np.ones(n_beats, dtype=bool))
 
-    def goto(self, idx):
-        self.idx = max(0, min(n_beats - 1, idx))
-        self.update()
+n_notched = np.sum(p_notched & is_clean)
+n_measured = np.sum(~np.isnan(p_notch_uv) & is_clean)
+print(f"\n  P-wave notch: {n_notched}/{n_measured} beats "
+      f"({100*n_notched/max(1,n_measured):.0f}%)")
+print(f"  Artifact beats excluded: {n_artifact}/{n_beats} "
+      f"({100*n_artifact/max(1,n_beats):.1f}%)")
+print(f"  Missed beats recovered: {n_recovered}")
 
-    def on_key(self, event):
-        if event.key in ('right', 'd'):
-            self.goto(self.idx + 1)
-        elif event.key in ('shift+right', 'D'):
-            self.goto(self.idx + 10)
-        elif event.key in ('left', 'a'):
-            self.goto(self.idx - 1)
-        elif event.key in ('shift+left', 'A'):
-            self.goto(self.idx - 10)
-        elif event.key == 'home':
-            self._reset_tl_zoom()
-            self.goto(0)
-        elif event.key == 'end':
-            self.goto(n_beats - 1)
-        elif event.key == 'up':
-            self.avg_window = min(100, self.avg_window + 5)
-            self._noise_timeline = None
-            if self.tl_mode == 'noise':
-                self._draw_timeline()
-            self.update()
-        elif event.key == 'down':
-            self.avg_window = max(2, self.avg_window - 5)
-            self._noise_timeline = None
-            if self.tl_mode == 'noise':
-                self._draw_timeline()
-            self.update()
-        elif event.key == 'g':
-            self.show_ghost = not self.show_ghost
-            self.update()
-        elif event.key == 't':
-            self.show_persist = not self.show_persist
-            self.update()
-        elif event.key == 'r':
-            self.show_avg = not self.show_avg
-            self.update()
-        elif event.key == 'p':
-            self.show_pwave = not self.show_pwave
-            self.update()
-        elif event.key == 'f':
-            self.use_filter = not self.use_filter
-            self.data = ecg_filtered if self.use_filter else data_raw
-            self.update()
-        elif event.key in ('1', '2', '3'):
-            self.num_beats = int(event.key)
-            self.update()
-        elif event.key == 'n':
-            self.tl_mode = 'noise' if self.tl_mode == 'hr' else 'hr'
-            self._draw_timeline()
-            self.fig.canvas.draw_idle()
-        elif event.key == 's':
-            fname = str(Path(CSV_FILE).parent / f"beat_{self.idx+1:04d}.png")
-            self.fig.savefig(fname, dpi=150, bbox_inches='tight')
-            print(f"Saved {fname}")
-        elif event.key in ('q', 'escape'):
-            plt.close(self.fig)
-
-# Launch
-scope = BeatScope()
-plt.show()
+n_pvc_total = np.sum(is_pvc)
+duration_min = (peaks[-1] - peaks[0]) / FS / 60 if n_beats > 1 else 0
+print(f"  PVCs: {n_pvc_total}/{n_beats} beats "
+      f"({100*n_pvc_total/max(1,n_beats):.1f}% burden, "
+      f"{n_pvc_total/max(0.01,duration_min):.1f}/min)")
+if n_pvc_total > 0:
+    stat_line("PVC QRS Correlation", qrs_corr[is_pvc], "")
+    # Check for couplets/triplets
+    pvc_idx = np.where(is_pvc)[0]
+    couplets = 0
+    triplets = 0
+    i_pvc = 0
+    while i_pvc < len(pvc_idx):
+        run = 1
+        while (i_pvc + run < len(pvc_idx) and
+               pvc_idx[i_pvc + run] == pvc_idx[i_pvc + run - 1] + 1):
+            run += 1
+        if run == 2:
+            couplets += 1
+        elif run >= 3:
+            triplets += 1
+        i_pvc += run
+    if couplets > 0 or triplets > 0:
+        print(f"  PVC runs: {couplets} couplets, {triplets} triplets/runs")

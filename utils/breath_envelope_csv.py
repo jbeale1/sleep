@@ -7,13 +7,15 @@ Outputs a sub-sampled CSV at 1-second intervals with:
   - breathing rate (breaths/min, 30s sliding window)
   - roll angle (degrees, low-pass smoothed ~60s window)
 
-Usage: python3 breath_envelope_csv.py <input.csv> [output.csv]
+Usage: python3 breath_envelope_csv.py <input.csv|directory> [output.csv]
+If input is a directory, searches for first MOT_<YYYY-MM-DD_HHMMSS>.csv file.
 If no output file given, uses input name with _breath suffix.
 J.Beale 2026-02-11
 """
 
 import sys
 import os
+import re
 import numpy as np
 from scipy.signal import butter, sosfiltfilt, find_peaks, hilbert
 
@@ -27,6 +29,23 @@ RATE_WINDOW = 60.0  # seconds, sliding window for breath rate
 ABS_FLOOR = 0.10 # reject tilt peaks below this absolute level, to avoid noise peaks when breathing is very shallow
 
 ROLL_LP = 0.017   # Hz lowpass for roll smoothing (~60s window)
+
+MOT_PATTERN = re.compile(r'^MOT_\d{4}-\d{2}-\d{2}_\d{6}\.csv$')
+
+
+def find_mot_csv(directory):
+    """
+    Search directory for the first MOT_<YYYY-MM-DD_HHMMSS>.csv file.
+    Returns the full path to the matching file, or None if not found.
+    """
+    if not os.path.isdir(directory):
+        return None
+    
+    files = sorted(os.listdir(directory))
+    for filename in files:
+        if MOT_PATTERN.match(filename):
+            return os.path.join(directory, filename)
+    return None
 
 
 def process(csv_path, out_path=None):
@@ -135,8 +154,19 @@ def process(csv_path, out_path=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python3 breath_envelope_csv.py <input.csv> [output.csv]")
+        print("Usage: python3 breath_envelope_csv.py <input.csv|directory> [output.csv]")
         sys.exit(1)
-    csv_path = sys.argv[1]
+    
+    input_path = sys.argv[1]
+    
+    # Check if input is a directory; if so, find the MOT_ CSV file
+    if os.path.isdir(input_path):
+        csv_path = find_mot_csv(input_path)
+        if csv_path is None:
+            print(f"Error: No MOT_*.csv file found in {input_path}")
+            sys.exit(1)
+    else:
+        csv_path = input_path
+    
     out_path = sys.argv[2] if len(sys.argv) > 2 else None
     process(csv_path, out_path)

@@ -2015,7 +2015,7 @@ def main():
     subtitle += f" &nbsp;&nbsp; • &nbsp;ODI(3%): {odi_3pct}/hr, ODI(4%): {odi_4pct}/hr"
     subtitle += f" &nbsp;&nbsp; • &nbsp;SpO\u2082&lt;90%: {time_below_90_min}m"
 
-    title_date = ref_date.strftime('%Y-%m-%d')
+    title_date = end_date.strftime('%Y-%m-%d')
 
     # Build compact JSON
     data = {
