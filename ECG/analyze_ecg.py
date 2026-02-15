@@ -55,6 +55,8 @@ parser.add_argument('--plot', choices=['all', 'hr'], default='all',
                     help='Which plot(s) to produce (default: all)')
 parser.add_argument('--csv-out', action='store_true', dest='csv_out',
                     help='Export per-beat metrics to CSV (same dir as input)')
+parser.add_argument('--save-summary', action='store_true', dest='save_summary',
+                    help='Save summary statistics to text file')
 args = parser.parse_args()
 
 if args.no_plot:
@@ -728,7 +730,7 @@ if args.plot == 'hr':
     format_time_axis(ax_hr)
     fig_hr.tight_layout()
     fig_hr.savefig(f"{stem}_hr.png", dpi=150, bbox_inches='tight')
-    print(f"Saved {stem}_hr.png")
+
 
 else:
     # ----- Figure 1: ECG trace + Heart Rate + R-R + HRV -----
@@ -880,10 +882,7 @@ else:
     fig4.tight_layout()
     fig4.savefig(f"{stem}_4_rsa.png", dpi=150, bbox_inches='tight')
 
-    print(f"Saved {stem}_1_rhythm.png")
-    print(f"Saved {stem}_2_qrs_st.png")
-    print(f"Saved {stem}_3_pt_waves.png")
-    print(f"Saved {stem}_4_rsa.png")
+
 
 if not args.no_plot:
     plt.show()
@@ -926,7 +925,60 @@ if args.csv_out:
                 f"{qrs_corr[i]:.3f}" if not np.isnan(qrs_corr[i]) else '',
                 f"{pvc_score[i]:.0f}" if not np.isnan(pvc_score[i]) else '',
             ])
-    print(f"Saved {csv_out_path}")
+
+
+# =============================================================
+# SUMMARY OUTPUT (optional save to file)
+# =============================================================
+_summary_file = None
+_original_stdout = sys.stdout
+
+if args.save_summary:
+    summary_path = f"{stem}_summary.txt"
+    _summary_file = open(summary_path, 'w')
+    # Write header info to file only
+    _summary_file.write(f"Source: {Path(CSV_FILE).name}\n")
+    _summary_file.write(f"Samples: {N} ({N/FS:.1f}s) at {FS} sps\n")
+    if time_source != 'elapsed':
+        _summary_file.write(f"Start: {t0_str}\n")
+    _summary_file.write(f"Beats: {n_beats} (artifacts: {n_artifact}, "
+                        f"PVCs: {np.sum(is_pvc)})\n\n")
+
+    class _Tee:
+        def __init__(self, file, stream):
+            self.file = file
+            self.stream = stream
+        def write(self, data):
+            self.stream.write(data)
+            self.file.write(data)
+        def flush(self):
+            self.stream.flush()
+            self.file.flush()
+
+    sys.stdout = _Tee(_summary_file, _original_stdout)
+
+# =============================================================
+# STUDY WINDOW MASK  (exclude data after 7:00 AM local time)
+# =============================================================
+# Beats recorded after 7 AM may include electrode disconnection artifacts.
+# We use this mask for extreme-value stats (longest pause, brady/tachy)
+# but not for general morphology stats which already have artifact rejection.
+
+STUDY_END_HOUR = 7  # 7:00 AM local time
+
+in_study = np.ones(n_beats, dtype=bool)
+if time_source != 'elapsed':
+    for i in range(n_beats):
+        dt = datetime.fromtimestamp(beat_epoch[i])
+        # If recording starts before midnight, hours < start_hour are next day
+        if dt.hour >= STUDY_END_HOUR and dt.hour < 20:
+            in_study[i] = False
+
+n_in_study = np.sum(in_study)
+n_excluded_study = n_beats - n_in_study
+if n_excluded_study > 0:
+    print(f"Study window: {n_in_study} beats before {STUDY_END_HOUR}:00 AM "
+          f"({n_excluded_study} post-study beats masked)")
 
 # =============================================================
 # SUMMARY STATS
@@ -945,6 +997,60 @@ def stat_line(name, arr, unit='', mask=None):
 
 stat_line("Heart Rate", hr_bpm, "bpm")
 stat_line("R-R Interval", rr_ms, "ms")
+
+# --- Median HR ---
+hr_clean = hr_bpm[~np.isnan(hr_bpm) & is_clean]
+if len(hr_clean) > 0:
+    print(f"  {'HR Median':25s}: {np.median(hr_clean):7.1f} bpm")
+
+# --- HR Distribution (5 bpm bins) ---
+if len(hr_clean) > 0:
+    bin_edges = [0, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 999]
+    bin_labels = ['<45','45-','50-','55-','60-','65-','70-','75-',
+                  '80-','85-','90-','95-','100+']
+    counts, _ = np.histogram(hr_clean, bins=bin_edges)
+    pcts = 100.0 * counts / len(hr_clean)
+    # Compact vector display: only show bins that have >0%
+    parts = []
+    for lbl, pct in zip(bin_labels, pcts):
+        if pct >= 0.05:  # show if ≥0.05%
+            parts.append(f"{lbl}:{pct:.1f}")
+    print(f"  {'HR Distribution (%)':25s}: [{', '.join(parts)}]")
+
+# --- Bradycardia / Tachycardia burden (within study window) ---
+hr_study = hr_bpm[~np.isnan(hr_bpm) & is_clean & in_study]
+if len(hr_study) > 0:
+    n_brady = np.sum(hr_study < 50)
+    n_tachy = np.sum(hr_study > 100)
+    print(f"  {'Brady (<50) / Tachy (>100)':25s}: "
+          f"{n_brady} ({100*n_brady/len(hr_study):.2f}%) / "
+          f"{n_tachy} ({100*n_tachy/len(hr_study):.2f}%)")
+
+# --- Min / Max 5-minute average HR ---
+HR_AVG_WINDOW_SEC = 300  # 5 minutes
+if len(hr_clean) > 0 and n_beats > 1:
+    hr_5min = np.full(n_beats, np.nan)
+    valid_hr_mask = ~np.isnan(hr_bpm) & is_clean & in_study
+    valid_hr_idx = np.where(valid_hr_mask)[0]
+    if len(valid_hr_idx) >= 10:
+        vt = beat_time[valid_hr_idx]
+        vh = hr_bpm[valid_hr_idx]
+        lo = 0
+        for ci in range(len(valid_hr_idx)):
+            t_center = vt[ci]
+            while lo < ci and vt[lo] < t_center - HR_AVG_WINDOW_SEC / 2:
+                lo += 1
+            hi = ci
+            while hi < len(valid_hr_idx) - 1 and vt[hi+1] <= t_center + HR_AVG_WINDOW_SEC / 2:
+                hi += 1
+            span = vt[hi] - vt[lo]
+            if span >= HR_AVG_WINDOW_SEC * 0.8 and hi - lo + 1 >= 10:
+                hr_5min[valid_hr_idx[ci]] = np.mean(vh[lo:hi+1])
+        hr_5min_valid = hr_5min[~np.isnan(hr_5min)]
+        if len(hr_5min_valid) > 0:
+            print(f"  {'HR 5-min avg (min/max)':25s}: "
+                  f"{np.min(hr_5min_valid):5.1f} / {np.max(hr_5min_valid):.1f} bpm")
+
 stat_line("QRS Amplitude", qrs_amp, "µV")
 stat_line("QRS Duration", qrs_dur_ms, "ms")
 stat_line("P-wave Amplitude", p_amp, "µV")
@@ -962,6 +1068,42 @@ stat_line("ST Level (J+80)", st_level, "µV")
 stat_line("SDNN", sdnn, "ms", mask=np.ones(n_beats, dtype=bool))
 stat_line("RMSSD", rmssd, "ms", mask=np.ones(n_beats, dtype=bool))
 
+# --- pNN50 ---
+rr_clean_mask = ~np.isnan(rr_ms) & is_clean
+rr_clean_vals = rr_ms[rr_clean_mask]
+if len(rr_clean_vals) > 1:
+    rr_diffs = np.abs(np.diff(rr_clean_vals))
+    pnn50 = 100.0 * np.sum(rr_diffs > 50) / len(rr_diffs)
+    print(f"  {'pNN50':25s}: {pnn50:7.1f} %")
+
+# --- HRV Triangular Index ---
+# Total clean R-R beats / mode-bin height, using 1/128s (~7.8ms) bins per standard
+if len(rr_clean_vals) > 10:
+    bin_width = 1000.0 / 128  # ~7.8125 ms per HRV standard
+    rr_min = np.floor(np.min(rr_clean_vals) / bin_width) * bin_width
+    rr_max = np.ceil(np.max(rr_clean_vals) / bin_width) * bin_width
+    hist_bins = np.arange(rr_min, rr_max + bin_width, bin_width)
+    hist_counts, _ = np.histogram(rr_clean_vals, bins=hist_bins)
+    mode_count = np.max(hist_counts)
+    if mode_count > 0:
+        hrv_tri = len(rr_clean_vals) / mode_count
+        print(f"  {'HRV Triangular Index':25s}: {hrv_tri:7.1f}")
+
+# --- Longest R-R pause (within study window, clean beats only) ---
+rr_study_mask = ~np.isnan(rr_ms) & in_study
+rr_study_vals = rr_ms[rr_study_mask]
+rr_study_idx = np.where(rr_study_mask)[0]
+if len(rr_study_vals) > 0:
+    longest_rr = np.max(rr_study_vals)
+    longest_rr_beat = rr_study_idx[np.argmax(rr_study_vals)]
+    pause_time_str = ""
+    if time_source != 'elapsed':
+        pause_dt = datetime.fromtimestamp(beat_epoch[longest_rr_beat])
+        pause_time_str = f" at {pause_dt.strftime('%H:%M:%S')}"
+    flag = " ⚠" if longest_rr > 2000 else ""
+    print(f"  {'Longest R-R pause':25s}: {longest_rr:7.0f} ms "
+          f"({longest_rr/1000:.2f}s){pause_time_str}{flag}")
+
 n_notched = np.sum(p_notched & is_clean)
 n_measured = np.sum(~np.isnan(p_notch_uv) & is_clean)
 print(f"\n  P-wave notch: {n_notched}/{n_measured} beats "
@@ -969,6 +1111,8 @@ print(f"\n  P-wave notch: {n_notched}/{n_measured} beats "
 print(f"  Artifact beats excluded: {n_artifact}/{n_beats} "
       f"({100*n_artifact/max(1,n_beats):.1f}%)")
 print(f"  Missed beats recovered: {n_recovered}")
+if n_excluded_study > 0:
+    print(f"  Post-study (>{STUDY_END_HOUR}AM) excluded: {n_excluded_study} beats")
 
 n_pvc_total = np.sum(is_pvc)
 duration_min = (peaks[-1] - peaks[0]) / FS / 60 if n_beats > 1 else 0
@@ -994,3 +1138,26 @@ if n_pvc_total > 0:
         i_pvc += run
     if couplets > 0 or triplets > 0:
         print(f"  PVC runs: {couplets} couplets, {triplets} triplets/runs")
+
+    # Longest PVC-free run (in beats and time)
+    if len(pvc_idx) >= 1:
+        # Gaps between consecutive PVCs (in beat indices)
+        pvc_gaps = np.diff(pvc_idx) - 1  # number of non-PVC beats between PVCs
+        # Also check gap before first PVC and after last PVC
+        gaps = [pvc_idx[0]]  # beats before first PVC
+        if len(pvc_gaps) > 0:
+            gaps.extend(pvc_gaps.tolist())
+        gaps.append(n_beats - 1 - pvc_idx[-1])  # beats after last PVC
+        max_gap_beats = max(gaps)
+        # Estimate time from beats (use mean R-R)
+        mean_rr_sec = np.nanmean(rr_ms[is_clean]) / 1000 if np.any(is_clean) else 0.85
+        max_gap_min = max_gap_beats * mean_rr_sec / 60
+        print(f"  Longest PVC-free run   : {max_gap_beats} beats ({max_gap_min:.1f} min)")
+
+# =============================================================
+# CLOSE SUMMARY FILE
+# =============================================================
+if _summary_file:
+    sys.stdout = _original_stdout
+    _summary_file.close()
+    print(f"Summary saved: {summary_path}")
