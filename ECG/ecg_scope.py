@@ -104,6 +104,33 @@ CSV_FILE = args.csv_file
 FS = args.sample_rate
 
 # =============================================================
+# RESOLVE INPUT FILE (support both file and directory)
+# =============================================================
+def find_ecg_csv(directory):
+    """
+    Search directory for the first ECG_<YYYYMMDD_HHMMSS>.csv file.
+    Returns the full path to the matching file, or None if not found.
+    """
+    ecg_pattern = re.compile(r'^ECG_\d{8}_\d{6}\.csv$')
+    if not Path(directory).is_dir():
+        return None
+    
+    files = sorted(Path(directory).iterdir())
+    for filepath in files:
+        if filepath.is_file() and ecg_pattern.match(filepath.name):
+            return str(filepath)
+    return None
+
+# Check if input is a directory; if so, find the ECG CSV file
+if Path(CSV_FILE).is_dir():
+    found_file = find_ecg_csv(CSV_FILE)
+    if found_file is None:
+        print(f"Error: No ECG_*.csv file found in {CSV_FILE}")
+        sys.exit(1)
+    CSV_FILE = found_file
+    print(f"Found ECG file: {CSV_FILE}")
+
+# =============================================================
 # LOAD DATA
 # =============================================================
 data_raw = np.loadtxt(CSV_FILE, delimiter=",", skiprows=1).flatten()
@@ -210,13 +237,20 @@ def load_sync_file(csv_path):
 # Build epoch array for each beat
 sync_idx, sync_epoch = load_sync_file(CSV_FILE)
 time_source = 'unknown'
+file_start_dt = None  # Store parsed datetime from filename for later use
+
 if sync_idx is not None:
     beat_epoch = np.interp(peaks.astype(float), sync_idx, sync_epoch)
     time_source = 'sync'
+    # Also extract date/time from filename if available, for use in titles
+    dt = parse_timestamp_from_filename(CSV_FILE)
+    if dt:
+        file_start_dt = dt
     print(f"Using sync file for wall-clock time")
 else:
     dt = parse_timestamp_from_filename(CSV_FILE)
     if dt:
+        file_start_dt = dt  # Store for later use
         t0_epoch = dt.timestamp()
         beat_epoch = t0_epoch + peaks / FS
         time_source = 'filename'
@@ -320,9 +354,9 @@ class BeatScope:
         self.show_persist = False  # storage scope persistence
         self.show_avg = True
         self.show_pwave = True
-        self.use_filter = True
+        self.use_filter = False
         self.num_beats = 1
-        self.data = ecg_filtered
+        self.data = data_raw
         self._dragging = False
         self.tl_mode = 'hr'          # 'hr' or 'noise'
         self._noise_timeline = None   # lazy-computed
@@ -410,8 +444,37 @@ class BeatScope:
         """Lazy-compute per-beat noise RMS (HP-filtered residual vs rolling avg)."""
         if self._noise_timeline is not None:
             return self._noise_timeline
+        
+        # Create a simple processing dialog window
+        import tkinter as tk
+        from tkinter import messagebox
+        import threading
+        
+        # Create processing window
+        proc_root = tk.Tk()
+        proc_root.title("Processing...")
+        proc_root.geometry("300x100")
+        proc_root.resizable(False, False)
+        
+        # Center the window
+        proc_root.update_idletasks()
+        x = proc_root.winfo_screenwidth() // 2 - 150
+        y = proc_root.winfo_screenheight() // 2 - 50
+        proc_root.geometry(f"+{x}+{y}")
+        
+        # Add label
+        label = tk.Label(proc_root, text="Computing noise timeline...\nPlease wait.", 
+                        font=("Arial", 12), pady=20)
+        label.pack()
+        
+        # Keep the window on top and responsive
+        proc_root.lift()
+        proc_root.attributes('-topmost', True)
+        proc_root.after(100)
+        
         print("Computing noise timeline...", end=' ', flush=True)
         noise = np.full(n_beats, np.nan)
+        
         for i in range(1, n_beats):
             b = get_beat(i, ecg_filtered)
             avg = compute_rolling_avg(i, ecg_filtered, self.avg_window)
@@ -420,7 +483,16 @@ class BeatScope:
             residual = b - avg
             residual_hp = signal.sosfilt(sos_noise_hp, residual)
             noise[i] = np.sqrt(np.mean(residual_hp ** 2))
+            
+            # Update progress label periodically
+            if i % max(1, n_beats // 20) == 0:
+                progress = int(100 * i / n_beats)
+                label.config(text=f"Computing noise timeline...\n{progress}% complete")
+                proc_root.update()
+        
         self._noise_timeline = noise
+        proc_root.destroy()
+        
         v = ~np.isnan(noise)
         print(f"done ({np.sum(v)} beats, "
               f"median {np.nanmedian(noise):.0f} µV)")
@@ -670,7 +742,31 @@ class BeatScope:
         ax.set_ylabel('T/R Ratio', fontsize=10)
         ax.legend(fontsize=8, loc='upper right')
         ax.grid(True, alpha=0.2)
-        ax.set_title(f'T/R Ratio vs Time  ({n} beats)', fontsize=11)
+        
+        # Build title with start date, start time, and duration
+        if file_start_dt:
+            start_date = file_start_dt.strftime('%Y-%m-%d')
+            start_time = file_start_dt.strftime('%H:%M')
+            # Calculate duration from first to last beat
+            duration_sec = int((beat_epoch[-1] - beat_epoch[0]))
+            duration_h = duration_sec // 3600
+            duration_m = (duration_sec % 3600) // 60
+            duration_str = f'{duration_h:02d}:{duration_m:02d}'
+            title_str = f'T/R Ratio vs Time  {start_date} {start_time} ({duration_str}) ({n} beats)'
+        elif time_source != 'elapsed':
+            # Fallback: extract from beat_epoch if available
+            start_dt = datetime.fromtimestamp(beat_epoch[0])
+            start_date = start_dt.strftime('%Y-%m-%d')
+            start_time = start_dt.strftime('%H:%M')
+            duration_sec = int((beat_epoch[-1] - beat_epoch[0]))
+            duration_h = duration_sec // 3600
+            duration_m = (duration_sec % 3600) // 60
+            duration_str = f'{duration_h:02d}:{duration_m:02d}'
+            title_str = f'T/R Ratio vs Time  {start_date} {start_time} ({duration_str}) ({n} beats)'
+        else:
+            title_str = f'T/R Ratio vs Time  ({n} beats)'
+        
+        ax.set_title(title_str, fontsize=11)
 
         # --- Panel 2: HR vs wall-clock time ---
         ax = axes[1]
