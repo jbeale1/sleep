@@ -5,7 +5,7 @@ Positional sleep statistics — correlate ECG, SpO2, and body position.
 
 Reads three data files (auto-detected from a directory or specified explicitly):
   1. ECG per-beat CSV (*_beats.csv from analyze_ecg.py --csv-out)
-  2. SpO2 CSV (Checkme O2 Ultra *.csv)
+  2. SpO2 CSV (Checkme O2 Ultra *.csv as exported from the "Checkme O2 Ultra" device)
   3. Position segments CSV (*_positions.csv from analyze_position.py)
 
 Computes per-position-segment statistics for HR, HRV, SpO2, and
@@ -14,6 +14,19 @@ desaturation events. Produces a summary table and CSV output.
 Usage:
   python positional_sleep_stats.py <directory>
   python positional_sleep_stats.py --ecg beats.csv --spo2 o2.csv --pos segments.csv
+
+Outputs:
+    HR — Mean heart rate (bpm)
+    HRmd — Median heart rate (bpm), less sensitive to outlier beats
+    SDNN — Standard deviation of R-R intervals (ms), overall HRV including slow oscillations
+    RMSSD — Root-mean-square of successive R-R differences (ms), beat-to-beat vagal/parasympathetic HRV
+    pNN50 — Percentage of successive R-R differences >50 ms, another parasympathetic index
+    SpO2 — Mean blood oxygen saturation (%)
+    O2md — Median blood oxygen saturation (%)
+    O2mn — Minimum blood oxygen saturation (%)
+    ODI3 — Oxygen Desaturation Index: ≥3% drops per hour, primary apnea severity metric
+    ≤90% — Percentage of time with SpO2 at or below 90%, hypoxemia burden
+    PVC — Count of premature ventricular contractions in that segment
 
 J. Beale  2026-02
 """
