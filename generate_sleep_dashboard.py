@@ -1091,11 +1091,12 @@ for (let i = 0; i < hrData.length; i++) {
   }
   if (!spo2Ok) continue;
 
-  // Check 4: 15-min HR MA non-increasing (not rising >1 bpm vs 2 min ago)
+  // Check 4: 15-min HR MA avg HR below 75 bpm
   if (i >= HR_LOOKBACK) {
-    if (hrMA15[i].v > hrMA15[i - HR_LOOKBACK].v + HR_RISE_TOL) continue;
+    if (hrMA15[i].v >= 75) continue;
   }
 
+  
   goodMask[i] = 1;
 }
 
@@ -2031,7 +2032,7 @@ def main():
     data_json = json.dumps(data, separators=(',', ':'))
 
     # SpO2 threshold for "Restful" detection: lower by 1% for Checkme
-    good_spo2_min = 95 if oximeter_type == 'checkme' else 96
+    good_spo2_min = 90 if oximeter_type == 'checkme' else 91
 
     # Generate HTML
     html = HTML_TEMPLATE
