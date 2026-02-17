@@ -11,6 +11,7 @@ Usage: python innovo_ble_plot.py [--csv prefix] [--seconds 10]
 
 import asyncio
 import argparse
+import os
 import time
 import csv
 import threading
@@ -169,6 +170,11 @@ def format_elapsed(seconds):
 def main(csv_prefix=None, plot_seconds=PLOT_SECONDS):
     oximeter = InnovoPulseOx(plot_seconds=plot_seconds, csv_prefix=csv_prefix)
     oximeter.open_csv()
+    if csv_prefix:
+        print(f"Output: {csv_prefix}_pleth.csv")
+        print(f"        {csv_prefix}_summary.csv")
+    else:
+        print("CSV output disabled.")
 
     ble_thread = threading.Thread(target=run_ble_thread, args=(oximeter,), daemon=True)
     ble_thread.start()
@@ -259,10 +265,21 @@ def main(csv_prefix=None, plot_seconds=PLOT_SECONDS):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Innovo IP900BPB Pulse Oximeter - Live Plot')
-    parser.add_argument('--csv', type=str, metavar='PREFIX',
-                        help='CSV output prefix (creates PREFIX_pleth.csv and PREFIX_summary.csv)')
+    parser.add_argument('--csv', type=str, metavar='PREFIX', default=None,
+                        help='CSV output prefix (creates PREFIX_pleth.csv and PREFIX_summary.csv). '
+                             'Default: YYYYMMDD_HHMMSS in script directory.')
+    parser.add_argument('--no-csv', action='store_true',
+                        help='Disable CSV file output')
     parser.add_argument('--seconds', type=int, default=PLOT_SECONDS,
                         help=f'Seconds of waveform visible (default {PLOT_SECONDS})')
     args = parser.parse_args()
 
-    main(csv_prefix=args.csv, plot_seconds=args.seconds)
+    if args.no_csv:
+        csv_prefix = None
+    elif args.csv:
+        csv_prefix = args.csv
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        csv_prefix = os.path.join(script_dir, datetime.now().strftime('%Y%m%d_%H%M%S'))
+
+    main(csv_prefix=csv_prefix, plot_seconds=args.seconds)
