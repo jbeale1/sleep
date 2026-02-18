@@ -29,7 +29,8 @@ from bleak import BleakClient, BleakScanner
 NOTIFY_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
 INDICATE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
 DEVICE_NAME = "IP900BPB"
-DEVICE_ADDR = "ED:9B:47:2E:0F:68"
+# DEVICE_ADDR = "ED:9B:47:2E:0F:68"
+DEVICE_ADDRS = {"ED:9B:47:2E:0F:68", "D3:67:B7:93:27:00"}
 
 # Plot config
 PLOT_SECONDS = 10
@@ -119,13 +120,14 @@ class InnovoPulseOx:
 async def ble_task(oximeter):
     """BLE connection and data reception."""
     print("Scanning for pulse oximeter...")
+    
     devices = await BleakScanner.discover(timeout=10.0)
     address = None
     for d in devices:
         if d.name and DEVICE_NAME in d.name:
             address = d.address
-            break
-        if d.address and d.address.upper() == DEVICE_ADDR.upper():
+            break        
+        if d.address and d.address.upper() in DEVICE_ADDRS:            
             address = d.address
             break
 
