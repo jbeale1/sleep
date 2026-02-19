@@ -29,8 +29,8 @@ from bleak import BleakClient, BleakScanner
 NOTIFY_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
 INDICATE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
 DEVICE_NAME = "IP900BPB"
-# DEVICE_ADDR = "ED:9B:47:2E:0F:68"
-DEVICE_ADDRS = {"ED:9B:47:2E:0F:68", "D3:67:B7:93:27:00"}
+# DEVICE_ADDRS = {"ED:9B:47:2E:0F:68", "D3:67:B7:93:27:00"} # two specific devices
+DEVICE_ADDRS = {}
 
 # Plot config
 PLOT_SECONDS = 10
@@ -120,17 +120,29 @@ class InnovoPulseOx:
 async def ble_task(oximeter):
     """BLE connection and data reception."""
     print("Scanning for pulse oximeter...")
-    
-    devices = await BleakScanner.discover(timeout=10.0)
-    address = None
-    for d in devices:
-        if d.name and DEVICE_NAME in d.name:
-            address = d.address
-            break        
-        if d.address and d.address.upper() in DEVICE_ADDRS:            
-            address = d.address
-            break
 
+    found_event = asyncio.Event()
+    found_address = [None]
+
+    def detection_callback(device, advertising_data):
+        if found_address[0]:
+            return
+        name = (advertising_data.local_name or device.name or "").upper()
+        if DEVICE_NAME in name or \
+           (DEVICE_ADDRS and device.address and device.address.upper() in DEVICE_ADDRS):
+            found_address[0] = device.address
+            print(f"  Found: {advertising_data.local_name or device.name!r} at {device.address}")
+            found_event.set()
+
+    scanner = BleakScanner(detection_callback=detection_callback)
+    await scanner.start()
+    try:
+        await asyncio.wait_for(found_event.wait(), timeout=10.0)
+    except asyncio.TimeoutError:
+        pass
+    await scanner.stop()
+
+    address = found_address[0]
     if not address:
         print(f"Device not found. Make sure {DEVICE_NAME} is on with finger inserted.")
         oximeter.running = False
