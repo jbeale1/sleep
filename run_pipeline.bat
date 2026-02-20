@@ -2,7 +2,7 @@
 setlocal
 
 set PYTHON=C:\Users\beale\AppData\Local\Programs\Python\Python312\python.exe
-set DIR=C:\Users\beale\Documents\2026-sleep\20260219
+set DIR=C:\Users\beale\Documents\2026-sleep\20260220
 set SCRIPTS=C:\Users\beale\Documents\2026-sleep\sleep
 
 echo ============================================
@@ -21,7 +21,7 @@ if errorlevel 1 echo *** FAILED ***
 
 echo.
 echo [3/7] analyze_ecg.py --no-plot --csv-out
-"%PYTHON%" "%SCRIPTS%\ECG\analyze_ecg.py" --no-plot --csv-out "%DIR%"
+"%PYTHON%" "%SCRIPTS%\ECG\analyze_ecg.py" --no-plot --csv-out --save-summary "%DIR%"
 if errorlevel 1 echo *** FAILED ***
 
 echo.

@@ -55,17 +55,23 @@ def find_input_files(input_dir):
         raise FileNotFoundError(
             f"No file matching 'Checkme O2 Ultra 2355_*.csv' or 'SleepU 6294_*.csv' in {input_dir}")
 
-    # Breathing analysis files (exact names)
+    # Breathing analysis files (optional)
     exact = {
         'resp_rate': 'breathing_analysis_report_respiratory_rate.csv',
         'apnea':     'breathing_analysis_report_apnea_events.csv',
         'obstruct':  'breathing_analysis_report_obstructions.csv',
     }
+    breathing_missing = []
     for key, name in exact.items():
         path = os.path.join(input_dir, name)
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Missing required file: {name}")
-        files[key] = path
+        if os.path.isfile(path):
+            files[key] = path
+        else:
+            breathing_missing.append(name)
+    if breathing_missing:
+        print(f"  Note: breathing analysis files not found, those panels will be blank:")
+        for name in breathing_missing:
+            print(f"    {name}")
 
     # Optional: tilt-based breathing envelope CSV
     breath_pattern = os.path.join(input_dir, "MOT_*_breath.csv")
@@ -1909,9 +1915,9 @@ def main():
     else:
         sleepu = read_sleepu(files['oximeter'], ref_date)
         oximeter_label = "SleepU"
-    rr = read_resp_rate(files['resp_rate'], ref_date)
-    apnea = read_apnea(files['apnea'], ref_date)
-    obstr = read_obstructions(files['obstruct'], ref_date)
+    rr    = read_resp_rate(files['resp_rate'], ref_date) if 'resp_rate' in files else []
+    apnea = read_apnea(files['apnea'], ref_date)         if 'apnea'     in files else []
+    obstr = read_obstructions(files['obstruct'], ref_date) if 'obstruct' in files else []
 
     # Optional tilt-based breathing data
     tilt_data = None
@@ -2011,9 +2017,11 @@ def main():
                 f"&rarr; {end_date.strftime('%Y-%m-%d')} {minutes_to_clock(last_t)} "
                 f"&nbsp;&middot;&nbsp; {format_duration(first_t, last_t)} recording"
                 f" &nbsp;&middot;&nbsp; {oximeter_label}")
-    # append apnea summary to subtitle for the dashboard
-    subtitle += f" &nbsp;&nbsp; • &nbsp;Apneas &gt;10s: {apnea_count_gt10}, &gt;50s: {apnea_count_gt50}"
-    subtitle += f" &nbsp;&nbsp; • &nbsp;ODI(3%): {odi_3pct}/hr, ODI(4%): {odi_4pct}/hr"
+    # append apnea summary to subtitle for the dashboard (only if breathing data available)
+    has_breathing = bool(apnea or obstr or rr)
+    if has_breathing:
+        subtitle += f" &nbsp;&nbsp; • &nbsp;Apneas &gt;10s: {apnea_count_gt10}, &gt;50s: {apnea_count_gt50}"
+        subtitle += f" &nbsp;&nbsp; • &nbsp;ODI(3%): {odi_3pct}/hr, ODI(4%): {odi_4pct}/hr"
     subtitle += f" &nbsp;&nbsp; • &nbsp;SpO\u2082&lt;90%: {time_below_90_min}m"
 
     title_date = end_date.strftime('%Y-%m-%d')
