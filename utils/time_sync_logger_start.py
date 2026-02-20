@@ -6,7 +6,7 @@ Passes through serial output so you can watch the startup.
 Delays response until the next integer second for sub-second sync to host time.
 Logs RP2040-vs-PC clock drift to a CSV file for crystal characterization.
 
-Usage: python3 time_sync_thing_logger.py [/dev/ttyACM0]
+Usage: python3 time_sync_logger_start.py [PORT]
 Press Ctrl+C to exit.
 J.Beale 2026-02-10
 """
@@ -15,14 +15,22 @@ import sys
 import os
 import time
 import serial
+import serial.tools.list_ports
 from datetime import datetime
 
-PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
+pt = "COM28" if os.name == "nt" else "/dev/ttyACM0"
+PORT = sys.argv[1] if len(sys.argv) > 1 else pt
 BAUD = 115200
+
+def port_exists(port):
+    if os.name == "nt":
+        return any(p.device == port for p in serial.tools.list_ports.comports())
+    else:
+        return os.path.exists(port)
 
 # --- Wait for port to appear ---
 print(f"Waiting for {PORT} ...")
-while not os.path.exists(PORT):
+while not port_exists(PORT):
     time.sleep(0.1)
 print(f"Port found, connecting...")
 
@@ -39,7 +47,11 @@ drift_count = 0
 
 try:
     while True:
-        raw = ser.readline().decode('utf-8', errors='ignore').strip()
+        try:
+            raw = ser.readline().decode('utf-8', errors='ignore').strip()
+        except serial.SerialException:
+            print("\nDevice disconnected.")
+            break            
         if not raw:
             continue
 
