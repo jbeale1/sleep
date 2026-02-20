@@ -509,6 +509,7 @@ def panel_breath_envelope(ax, data, ref_epoch):
 
     ax.set_ylabel('degrees', fontsize=9)
     ax.set_title('Breathing Motion Envelope', fontsize=10, loc='left')
+    ax.set_ylim(0, 6) # just clip on the larger peaks
     ax.grid(True, alpha=0.3)
     return True
 
@@ -657,6 +658,11 @@ for i, (name, func, _) in enumerate(active_panels):
 
 # Format the shared time axis on the bottom panel
 format_time_axis(axes[-1], duration_sec)
+
+# Lock all panels to the time range of the heartrate (beats) data
+xlim_start = epoch_to_mpl(np.array([beats_start]), ref_epoch)[0]
+xlim_end   = epoch_to_mpl(np.array([beats_end]),   ref_epoch)[0]
+axes[0].set_xlim(xlim_start, xlim_end)
 
 fig.tight_layout()
 
