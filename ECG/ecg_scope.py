@@ -168,7 +168,7 @@ ecg_det_sq = ecg_det ** 2
 ma_len = max(1, int(0.12 * FS))
 ecg_ma = uniform_filter1d(ecg_det_sq, ma_len)
 
-refract = int(0.40 * FS)
+refract = int(0.25 * FS)   # 250ms — supports up to ~220 bpm
 threshold = 0.3 * np.max(ecg_ma[:FS * 2])
 min_threshold = 0.05 * np.max(ecg_ma[:FS * 2])  # floor to prevent P-wave triggers
 peaks = []

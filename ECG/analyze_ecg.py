@@ -20,8 +20,8 @@ Metrics per beat:
 Usage:
   python analyze_ecg.py <csv_file> [sample_rate] [--prefiltered] [--no-plot] [--plot hr] [--csv-out]
   python analyze_ecg.py ECG_20260213.csv 250
-  python analyze_ecg.py ECG_20260213.csv 250 --plot hr
-  python analyze_ecg.py ECG_filtered.csv 250 --prefiltered --no-plot
+  python analyze_ecg.py ECG_filtered.csv 250 --plot hr --prefiltered
+  python analyze_ecg.py ECG_filtered.csv 250 --no-plot --csv-out
 
 Wall-clock time: auto-detects _sync.csv file for NTP-locked timestamps,
 falls back to YYYYMMDD_HHMMSS from filename, or elapsed time.
@@ -100,7 +100,7 @@ NOTCH_FREQ = 60   # powerline notch (Hz)
 LP_FREQ = 40      # lowpass (Hz)
 
 # Detection
-REFRACT_SEC = 0.40        # refractory period after R-peak (sec)
+REFRACT_SEC = 0.25        # refractory period after R-peak (sec) — supports up to ~220 bpm
 QRS_SEARCH_MS = 80        # half-width for QRS onset/offset search (ms)
 P_WINDOW_MS = (200, 40)   # P-wave search window: 200–40 ms before R
 T_WINDOW_MS = (160, 550)  # T-wave search: 160–550 ms after R
