@@ -32,8 +32,8 @@ Note: first do:
 J. Beale  v1.3 2026-02-13
 """
 
-VERSION = "1.3"
-VERSION_DATE = "2026-02-13"
+VERSION = "1.4"
+VERSION_DATE = "2026-02-20"
 
 import spidev
 import time
@@ -149,8 +149,11 @@ zi = sosfilt_zi(sos_all) * 0.0
 # =========================
 REFRACT_SAMPLES = int(0.40 * FS_OUT)  # 400ms refractory period
 peak_threshold = 400.0       # µV initial guess, adapts
+PEAK_THRESHOLD_MIN = 100.0   # µV floor — never decay below this
+PEAK_THRESHOLD_MAX = 5000.0  # µV ceiling — cap artifact inflation
 last_peak_idx = -REFRACT_SAMPLES
-peak_adapt_alpha = 0.1       # EMA smoothing for threshold
+peak_adapt_alpha = 0.1       # EMA smoothing for threshold upward
+peak_decay_alpha = 0.002     # per-sample decay rate when no peak seen
 
 # Peak-tracking state machine
 in_peak = False              # True while tracking a candidate R-peak
@@ -173,6 +176,26 @@ recent_qt_ms   = deque(maxlen=MAX_BEATS)
 
 prev_peak_out_idx = None
 pending_twave_pos = None     # buffer position of most recent R-peak
+
+# =========================
+# Signal / recording state
+# =========================
+ACQ_WAITING   = 0   # waiting for initial valid ECG signal; not yet writing
+ACQ_RECORDING = 1   # signal valid; writing to disk
+ACQ_PAUSED    = 2   # signal lost mid-recording; counting samples, not writing
+
+acq_state = ACQ_WAITING
+
+NO_SIGNAL_RR_MULTIPLE  = 5    # declare loss after this many missed expected beats
+NO_SIGNAL_FALLBACK_S   = 60   # fallback if RR not yet established (seconds)
+NO_SIGNAL_MIN_S        = 120  # floor: never trigger pause sooner than this
+
+def no_signal_timeout_samples():
+    if len(recent_rr_ms) >= 2:
+        mean_rr_samp = np.mean(recent_rr_ms) / 1000.0 * FS_OUT
+        rr_based = int(NO_SIGNAL_RR_MULTIPLE * mean_rr_samp)
+        return max(rr_based, int(NO_SIGNAL_MIN_S * FS_OUT))
+    return int(NO_SIGNAL_FALLBACK_S * FS_OUT)
 
 # =========================
 # Output buffers
@@ -271,7 +294,8 @@ def measure_twave_from_ring(r_buf_pos):
 # =========================
 email_sent = False
 SEND_EMAIL_DIR = "/home/pi/ECG"
-EMAIL_AFTER_SAMPLES = FS_OUT * 60  # send email after 1 minute of data
+EMAIL_AFTER_RECORDING_SAMPLES = FS_OUT * 60  # 1 min of valid recording
+recording_sample_count = 0   # increments only while ACQ_RECORDING
 
 def build_summary():
     """Build a summary string from recent stats."""
@@ -374,6 +398,19 @@ try:
 
         frame = spi.readbytes(27)
 
+        # Wait for DRDY to deassert (go high) before next sample.
+        # Prevents re-reading on the same DRDY pulse if the SPI transaction
+        # completed while DRDY was still low (causes all-zero frames).
+        t_deassert = time.time() + 0.020
+        while GPIO.input(37) == 0:
+            if time.time() > t_deassert:
+                break
+
+        # STATUS[23:20] are hardwired to 0b1100 by the ADS1299.
+        # A wrong value means this is a stale or mis-timed read; discard it.
+        if (frame[0] & 0xF0) != 0xC0:
+            continue
+
         raw = (frame[24] << 16) | (frame[25] << 8) | frame[26]
         if raw & 0x800000:
             raw -= 1 << 24
@@ -392,7 +429,7 @@ try:
                 t_start = time.time()
                 sync_buf.clear()
                 sync_buf.append((0, t_start))
-                print(f"Filter settled, recording started: "
+                print(f"Filter settled, waiting for ECG signal: "
                       f"{datetime.now().isoformat()}")
             continue
 
@@ -400,10 +437,15 @@ try:
         if in_sample_count % DECIMATE == 0:
             val = y[0]          # filtered — for beat detection & stats
 
-            # Write RAW to file buffer
-            ecg_buf[ecg_idx] = sample_uv
-            ecg_idx += 1
+            # Always increment so R-peak indices stay coherent and
+            # gaps during PAUSED/WAITING are preserved in the sync file.
             out_sample_count += 1
+
+            # Write RAW to file buffer only while signal is valid
+            if acq_state == ACQ_RECORDING:
+                ecg_buf[ecg_idx] = sample_uv
+                ecg_idx += 1
+                recording_sample_count += 1
 
             # Write FILTERED to circular analysis buffer
             analysis_buf[abuf_write] = val
@@ -430,6 +472,15 @@ try:
             since_peak = out_sample_count - last_peak_idx
 
             if not in_peak:
+                # Decay threshold toward floor when no peak seen for > 1 RR
+                decay_start = int(np.mean(recent_rr_ms) / 1000.0 * FS_OUT
+                                  ) if len(recent_rr_ms) >= 2 else REFRACT_SAMPLES
+                if since_peak > decay_start:
+                    peak_threshold = max(
+                        PEAK_THRESHOLD_MIN,
+                        peak_threshold * (1.0 - peak_decay_alpha)
+                    )
+
                 # Look for threshold crossing after refractory
                 if val > peak_threshold and since_peak > REFRACT_SAMPLES:
                     in_peak = True
@@ -448,11 +499,12 @@ try:
                     in_peak = False
                     last_peak_idx = candidate_idx
 
-                    # Adapt threshold
-                    peak_threshold = (
+                    # Adapt threshold upward, capped to avoid artifact lock-up
+                    new_thresh = (
                         peak_adapt_alpha * 0.4 * candidate_amp +
                         (1 - peak_adapt_alpha) * peak_threshold
                     )
+                    peak_threshold = min(new_thresh, PEAK_THRESHOLD_MAX)
 
                     recent_qrs_amp.append(candidate_amp)
 
@@ -469,6 +521,31 @@ try:
                     pending_twave_pos = candidate_buf_pos
                     samples_since_rpeak = 0
 
+            # --- Signal / recording state machine ---
+            timeout_samp = no_signal_timeout_samples()
+            samples_since_peak = out_sample_count - last_peak_idx
+
+            if acq_state == ACQ_WAITING:
+                if len(recent_rr_ms) >= 2:
+                    acq_state = ACQ_RECORDING
+                    print(f"Signal acquired, recording started: "
+                          f"{datetime.now().isoformat()}", flush=True)
+
+            elif acq_state == ACQ_RECORDING:
+                if samples_since_peak > timeout_samp:
+                    acq_state = ACQ_PAUSED
+                    print(f"  No signal — recording paused at sample "
+                          f"{out_sample_count} "
+                          f"({datetime.now().isoformat()})", flush=True)
+
+            elif acq_state == ACQ_PAUSED:
+                # A peak was just committed if last_peak_idx is very recent
+                if samples_since_peak < REFRACT_SAMPLES:
+                    acq_state = ACQ_RECORDING
+                    print(f"  Signal restored — recording resumed at sample "
+                          f"{out_sample_count} "
+                          f"({datetime.now().isoformat()})", flush=True)
+
             # --- Flush ECG file buffer ---
             if ecg_idx >= CHUNK:
                 for v in ecg_buf[:ecg_idx]:
@@ -477,11 +554,14 @@ try:
 
             # --- Periodic stats ---
             if out_sample_count - last_stats_out >= STATS_INTERVAL:
-                print_stats()
+                if acq_state == ACQ_RECORDING:
+                    recent_peak_samples = out_sample_count - last_peak_idx
+                    if recent_peak_samples <= 6 * FS_OUT:
+                        print_stats()
                 last_stats_out = out_sample_count
 
-                # Send email summary after first minute
-                if not email_sent and out_sample_count >= EMAIL_AFTER_SAMPLES:
+                # Send email after first full minute of valid recording
+                if not email_sent and recording_sample_count >= EMAIL_AFTER_RECORDING_SAMPLES:
                     send_email_summary()
 
         # --- Periodic timestamp sync ---
