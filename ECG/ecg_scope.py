@@ -48,7 +48,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
-VERSION = '1.1.0'
+VERSION = '1.1.3'
 
 matplotlib.rcParams['keymap.fullscreen'] = []  # free 'f' from fullscreen toggle
 matplotlib.rcParams['keymap.save'] = []        # free 's' from save dialog
@@ -179,11 +179,33 @@ refract = int(0.25 * FS)   # 250ms — supports up to ~220 bpm
 threshold = 0.3 * np.max(ecg_ma[:FS * 2])
 min_threshold = 0.05 * np.max(ecg_ma[:FS * 2])  # floor to prevent P-wave triggers
 
-# Determine R-peak polarity from whole file: find whether the global
-# max or min of the filtered signal is larger in absolute value.
-# This avoids argmax(abs) accidentally picking the S-wave when |S| > |R|.
-r_polarity = 1 if np.max(ecg_filtered) >= np.abs(np.min(ecg_filtered)) else -1
-print(f"Polarity: {'positive' if r_polarity > 0 else 'negative'}  Starting peak detection...", flush=True)
+# Determine R-peak polarity by timing vote across 60 evenly-spaced probe
+# windows distributed across the whole file.  Within each QRS window the
+# R-peak always precedes the S-wave regardless of relative amplitudes:
+#   argmax(ecg_det) <= argmin(ecg_det) -> positive lead
+#   argmin(ecg_det) <  argmax(ecg_det) -> negative lead
+# This is robust against DC offsets and leads where |S| > |R|, both of which
+# defeat a simple global max vs abs(min) amplitude comparison.
+_n_probes  = 60
+_half_win  = int(0.20 * FS)
+_pos_votes = 0
+_neg_votes = 0
+_probe_centres = np.linspace(int(1.0 * FS), N - int(1.0 * FS), _n_probes, dtype=int)
+for _pc in _probe_centres:
+    _ws = max(0, _pc - _half_win)
+    _we = min(N, _pc + _half_win)
+    _local_peak = _ws + np.argmax(ecg_ma[_ws:_we])
+    _ws2 = max(0, _local_peak - int(0.15 * FS))
+    _we2 = min(N, _local_peak + int(0.15 * FS))
+    _seg = ecg_det[_ws2:_we2]
+    if len(_seg) < 4:
+        continue
+    if np.argmax(_seg) <= np.argmin(_seg):
+        _pos_votes += 1
+    else:
+        _neg_votes += 1
+r_polarity = 1 if _pos_votes >= _neg_votes else -1
+print(f"Polarity: {'positive' if r_polarity > 0 else 'negative'} (votes +{_pos_votes}/-{_neg_votes})  Starting peak detection...", flush=True)
 
 peaks = []
 i = int(0.5 * FS)
@@ -1008,7 +1030,7 @@ class BeatScope:
         # Wall-clock string
         if time_source != 'elapsed':
             wall_str = datetime.fromtimestamp(
-                beat_epoch[self.idx]).strftime('%H:%M:%S')
+                beat_epoch[self.idx]).strftime('%Y-%m-%d %H:%M:%S')
         else:
             m, s = divmod(r_time, 60)
             wall_str = f'{int(m)}:{s:05.2f}'
