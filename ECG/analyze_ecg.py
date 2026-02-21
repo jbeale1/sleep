@@ -1028,6 +1028,16 @@ if len(hr_clean) > 0:
         if pct >= 0.05:  # show if ≥0.05%
             parts.append(f"{lbl}:{pct:.1f}")
     print(f"  {'HR Distribution (%)':25s}: [{', '.join(parts)}]")
+    # Text-mode bar chart
+    max_pct = max((p for p in pcts if p >= 0.05), default=1.0)
+    bar_width = 40  # max bar length in characters
+    print()
+    for lbl, pct in zip(bin_labels, pcts):
+        if pct >= 0.05:
+            bar_len = max(1, round(pct / max_pct * bar_width))
+            bar = '*' * bar_len
+            print(f"    {lbl:>5}  {bar:<{bar_width}}  {pct:5.1f}%")
+    print()
 
 # --- Bradycardia / Tachycardia burden (within study window) ---
 hr_study = hr_bpm[~np.isnan(hr_bpm) & is_clean & in_study]
