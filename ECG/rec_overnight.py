@@ -147,7 +147,7 @@ zi = sosfilt_zi(sos_all) * 0.0
 # =========================
 # R-peak detector state
 # =========================
-REFRACT_SAMPLES = int(0.25 * FS_OUT)  # 250ms — supports up to ~220 bpm
+REFRACT_SAMPLES = int(0.32 * FS_OUT)  # 320ms — blocks T-waves at resting HR; supports up to ~185 bpm
 peak_threshold = 400.0       # µV initial guess, adapts
 PEAK_THRESHOLD_MIN = 100.0   # µV floor — never decay below this
 PEAK_THRESHOLD_MAX = 5000.0  # µV ceiling — cap artifact inflation

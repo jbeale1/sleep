@@ -48,6 +48,8 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
+VERSION = '1.1.0'
+
 matplotlib.rcParams['keymap.fullscreen'] = []  # free 'f' from fullscreen toggle
 matplotlib.rcParams['keymap.save'] = []        # free 's' from save dialog
 matplotlib.rcParams['keymap.pan'] = []         # free 'p' from pan mode
@@ -142,11 +144,12 @@ print(f"Loaded {N} samples ({N/FS:.1f}s) at {FS} sps from {CSV_FILE}")
 # =============================================================
 sos_hp = signal.butter(2, HP_FREQ, 'highpass', fs=FS, output='sos')
 b_n, a_n = signal.iirnotch(NOTCH_FREQ, Q=NOTCH_Q, fs=FS)
+sos_notch = signal.tf2sos(b_n, a_n)
 sos_lp = signal.butter(4, LP_FREQ, 'lowpass', fs=FS, output='sos')
 
 def apply_filters(data):
     d = signal.sosfiltfilt(sos_hp, data)
-    d = signal.filtfilt(b_n, a_n, d)
+    d = signal.sosfiltfilt(sos_notch, d)
     d = signal.sosfiltfilt(sos_lp, d)
     return d
 
@@ -157,35 +160,56 @@ else:
     print(f"Data marked as pre-filtered, skipping filters")
 
 ecg_filtered = apply_filters(data_raw)
+print(f"Filtering done.", flush=True)
 ecg_display = ecg_filtered.copy()  # start with filtered view
 
 # =============================================================
 # R-PEAK DETECTION
 # =============================================================
+print(f"Running bandpass...", flush=True)
 sos_det = signal.butter(2, [5, min(20, FS/2 - 1)], 'bandpass', fs=FS, output='sos')
 ecg_det = signal.sosfiltfilt(sos_det, ecg_filtered)
+print(f"Bandpass done.", flush=True)
 ecg_det_sq = ecg_det ** 2
 ma_len = max(1, int(0.12 * FS))
 ecg_ma = uniform_filter1d(ecg_det_sq, ma_len)
+print(f"MA done.", flush=True)
 
 refract = int(0.25 * FS)   # 250ms — supports up to ~220 bpm
 threshold = 0.3 * np.max(ecg_ma[:FS * 2])
 min_threshold = 0.05 * np.max(ecg_ma[:FS * 2])  # floor to prevent P-wave triggers
+
+# Determine R-peak polarity from whole file: find whether the global
+# max or min of the filtered signal is larger in absolute value.
+# This avoids argmax(abs) accidentally picking the S-wave when |S| > |R|.
+r_polarity = 1 if np.max(ecg_filtered) >= np.abs(np.min(ecg_filtered)) else -1
+print(f"Polarity: {'positive' if r_polarity > 0 else 'negative'}  Starting peak detection...", flush=True)
+
 peaks = []
 i = int(0.5 * FS)
 
 while i < N - int(0.5 * FS):
     if ecg_ma[i] > threshold:
-        # Search wider window for true R-peak in filtered ECG
-        search_start = max(0, i - int(0.15 * FS))
-        search_end = min(N, i + int(0.15 * FS))
-        r_idx = search_start + np.argmax(ecg_filtered[search_start:search_end])
+        # Asymmetric window: look further back than forward.
+        # If threshold is inflated the MA crossing may occur on the S-wave
+        # downslope, leaving the R-peak behind i rather than ahead of it.
+        search_start = max(0, i - int(0.25 * FS))
+        search_end = min(N, i + int(0.10 * FS))
+        seg = ecg_filtered[search_start:search_end]
+        r_idx = search_start + (np.argmax(seg) if r_polarity > 0 else np.argmin(seg))
         peaks.append(r_idx)
-        threshold = 0.3 * ecg_ma[i] + 0.7 * threshold
+        # Set threshold from last detected peak only — no EMA history.
+        # EMA carried forward high-amplitude exercise beats and prevented
+        # detection of subsequent lower-amplitude beats.
+        ma_peak = np.max(ecg_ma[search_start:search_end])  # use MA peak, not rising-edge crossing value
+        threshold = 0.4 * ma_peak
+        min_threshold = max(min_threshold, 0.05 * ma_peak)
         threshold = max(threshold, min_threshold)
-        i = r_idx + refract
+        i = max(i + 1, r_idx + refract)
     else:
+        # Decay both threshold and floor
         threshold *= 0.9995
+        min_threshold *= 0.9995
         threshold = max(threshold, min_threshold)
         i += 1
 
@@ -368,7 +392,7 @@ class BeatScope:
                       left=0.06, right=0.98, top=0.94, bottom=0.06)
         self.ax = self.fig.add_subplot(gs[0])
         self.ax_tl = self.fig.add_subplot(gs[1])
-        self.fig.canvas.manager.set_window_title('ECG Beat Scope')
+        self.fig.canvas.manager.set_window_title(f'ECG Beat Scope v{VERSION}')
 
         # --- Timeline strip ---
         self._draw_timeline()
@@ -1013,7 +1037,7 @@ class BeatScope:
         self.status_text.set_text(
             f'[{"  ".join(flags)}]  '
             f'\u2190\u2192:step  Shift:\u00d710  '
-            f'G:ghost  T:persist  R:avg  \u2191\u2193:N  F:filter  P:highlight  N:timeline  H:hist  J:T/R  K:analysis  S:save  Q:quit'
+            f'G:ghost  T:persist  R:avg  \u2191\u2193:N  1-4:beats  F:filter  P:highlight  N:timeline  H:hist  J:T/R  K:analysis  S:save  W:export  Q:quit'
         )
 
         self.ax.legend(loc='upper right', fontsize=8)
@@ -1070,6 +1094,9 @@ class BeatScope:
         elif event.key in ('1', '2', '3'):
             self.num_beats = int(event.key)
             self.update()
+        elif event.key == '4':
+            self.num_beats = 15
+            self.update()
         elif event.key == 'n':
             self.tl_mode = 'noise' if self.tl_mode == 'hr' else 'hr'
             self._draw_timeline()
@@ -1084,6 +1111,19 @@ class BeatScope:
             fname = str(Path(CSV_FILE).parent / f"beat_{self.idx+1:04d}.png")
             self.fig.savefig(fname, dpi=150, bbox_inches='tight')
             print(f"Saved {fname}")
+        elif event.key == 'w':
+            # Export raw samples for the currently displayed window to CSV
+            last_beat = min(self.idx + self.num_beats - 1, n_beats - 1)
+            r_first = peaks[self.idx]
+            r_last  = peaks[last_beat]
+            start = max(0, r_first - pre_samp)
+            end   = min(N, r_last + post_samp + 1)
+            segment = data_raw[start:end]
+            fname = str(Path(CSV_FILE).parent /
+                        f"raw_beats_{self.idx+1:04d}-{last_beat+1:04d}.csv")
+            np.savetxt(fname, segment, fmt='%.2f', header='ecg_raw_uV',
+                       comments='')
+            print(f"Exported {len(segment)} raw samples → {fname}")
         elif event.key in ('q', 'escape'):
             plt.close(self.fig)
 

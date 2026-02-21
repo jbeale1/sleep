@@ -220,6 +220,9 @@ ecg_det_sq = ecg_det ** 2
 ma_len = int(0.12 * FS)
 ecg_ma = uniform_filter1d(ecg_det_sq, ma_len)
 
+# Determine R-peak polarity from whole file to avoid argmax(abs) picking S-wave
+r_polarity = 1 if np.max(ecg) >= np.abs(np.min(ecg)) else -1
+
 # Adaptive threshold
 refract = int(REFRACT_SEC * FS)
 threshold = 0.3 * np.max(ecg_ma[:FS*2])  # init from first 2 sec
@@ -229,20 +232,28 @@ i = int(0.5 * FS)  # skip first 0.5s
 
 while i < N - int(0.5 * FS):
     if ecg_ma[i] > threshold:
-        # Search for true R-peak in original filtered ECG
-        search_start = max(0, i - int(0.15 * FS))
-        search_end = min(N, i + int(0.15 * FS))
-        r_idx = search_start + np.argmax(ecg[search_start:search_end])
+        # Asymmetric window: look further back than forward.
+        # If threshold is inflated the MA crossing may occur on the S-wave
+        # downslope, leaving the R-peak behind i rather than ahead of it.
+        search_start = max(0, i - int(0.25 * FS))
+        search_end = min(N, i + int(0.10 * FS))
+        seg = ecg[search_start:search_end]
+        r_idx = search_start + (np.argmax(seg) if r_polarity > 0 else np.argmin(seg))
         peaks.append(r_idx)
 
-        # Adapt threshold
-        threshold = 0.3 * ecg_ma[i] + 0.7 * threshold
+        # Set threshold from last detected peak only — no EMA history.
+        # EMA carried forward high-amplitude exercise beats and prevented
+        # detection of subsequent lower-amplitude beats.
+        ma_peak = np.max(ecg_ma[search_start:search_end])  # use MA peak, not rising-edge crossing value
+        threshold = 0.4 * ma_peak
+        min_threshold = max(min_threshold, 0.05 * ma_peak)
         threshold = max(threshold, min_threshold)
 
-        i = r_idx + refract
+        i = max(i + 1, r_idx + refract)
     else:
-        # Decay threshold slowly to avoid losing beats
+        # Decay both threshold and floor
         threshold *= 0.9995
+        min_threshold *= 0.9995
         threshold = max(threshold, min_threshold)
         i += 1
 
@@ -285,11 +296,12 @@ if len(peaks) > RECOVERY_WINDOW + 2:
                 gap_sq = ecg_det_sq[gap_start:gap_end]
                 qrs_pos = gap_start + np.argmax(gap_sq)
 
-                # Find the actual R-peak (max |ecg|) within ±30ms
+                # Find the actual R-peak (max |ecg|) within ±30ms; abs() handles inverted leads
                 hw_refine = int(0.03 * FS)
                 ss = max(0, qrs_pos - hw_refine)
                 se = min(N, qrs_pos + hw_refine + 1)
-                r_idx = ss + np.argmax(ecg[ss:se])
+                seg = ecg[ss:se]
+                r_idx = ss + (np.argmax(seg) if r_polarity > 0 else np.argmin(seg))
                 recovered.append(r_idx)
 
 n_recovered = len(recovered)
