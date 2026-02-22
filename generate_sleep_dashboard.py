@@ -634,8 +634,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="legend-item"><div class="legend-swatch" id="lsw-hr" style="background:#e85878"></div>Heart Rate (bpm)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-hrma" style="background:rgba(255,220,80,0.85)"></div>HR Trend (~5m avg)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-ecghr" style="background:rgba(80,220,190,0.9)"></div>ECG HR (med-3)</div>
-  <div class="legend-item"><div class="legend-swatch" id="lsw-resp" style="background:#58d888"></div>Resp. Rate (br/min)</div>
-  <div class="legend-item"><div class="legend-swatch" id="lsw-tiltrr" style="background:#40d0d0"></div>Tilt Resp. Rate</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-tiltenv" style="background:rgba(64,208,208,0.4)"></div>Breath Envelope (°)</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnea" style="background:rgba(255,80,60,0.5)"></div>Apnea</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnealong" style="background:rgba(255,220,40,0.8)"></div>Apnea &gt;50s</div>
@@ -754,9 +752,6 @@ function updateLegendColors() {
   document.getElementById('lsw-hrma').style.background = theme.hrMA;
   const ecgHREl = document.getElementById('lsw-ecghr');
   if (ecgHREl) ecgHREl.style.background = theme.ecgHR;
-  document.getElementById('lsw-resp').style.background = theme.resp;
-  const tiltRREl = document.getElementById('lsw-tiltrr');
-  if (tiltRREl) tiltRREl.style.background = theme.tiltResp;
   const tiltEnvEl = document.getElementById('lsw-tiltenv');
   if (tiltEnvEl) tiltEnvEl.style.background = theme.tiltEnvLine;
   document.getElementById('lsw-apnea').style.background = theme.apneaBar;
@@ -1053,7 +1048,7 @@ const tiltRRData  = (RAW.tiltRR  || []).map(d => ({t: d[0], v: d[1]}));
 const tiltEnvData = (RAW.tiltEnv || []).map(d => ({t: d[0], v: d[1]}));
 const tiltRollData = (RAW.tiltRoll || []).map(d => ({t: d[0], v: d[1]}));
 const ecgHRData   = (RAW.ecgHR   || []).map(d => ({t: d[0], v: d[1]}));
-const hasTilt  = tiltRRData.length > 0;
+const hasTilt  = tiltEnvData.length > 0;
 const hasRoll  = tiltRollData.length > 0;
 const hasEcgHR = ecgHRData.length > 0;
 
@@ -1280,36 +1275,34 @@ function draw() {
     ctx.restore();
   }
 
-  // Panel 2: Respiratory Rate
-  drawYAxis(RR_MIN, RR_MAX, 2, rrTicks, 'Resp br/m', theme.resp);
-  drawArea(rrData, 't', 'v', RR_MIN, RR_MAX, 2, theme.respArea);
-  drawLine(rrData, 't', 'v', RR_MIN, RR_MAX, 2, theme.resp, 1.2);
-
-  // Tilt-based breathing data overlay on Panel 2
+  // Panel 2: Breath Envelope amplitude only
   if (hasTilt) {
-    // Envelope amplitude as filled area (mapped to right Y axis in degrees)
+    const envStep = ENV_MAX > 2 ? 1 : 0.5;
+    drawYAxis(0, ENV_MAX, 2, makeTicks(0, ENV_MAX, envStep), 'Breath amp °', theme.tiltEnvLine);
+
     const P2_TOP = panelTop(2);
     const P2_H = PANEL_HEIGHTS[2];
     ctx.save();
     ctx.beginPath();
     ctx.rect(MARGIN.left, P2_TOP, plotW, P2_H);
     ctx.clip();
+
+    // Filled area under envelope
     ctx.fillStyle = theme.tiltEnv;
     ctx.beginPath();
     let started = false;
+    const baseY2 = valToY(0, 0, ENV_MAX, 2);
     for (const d of tiltEnvData) {
       const x = tToX(d.t);
       if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
-      const yTop = P2_TOP + P2_H - (Math.min(d.v, ENV_MAX) / ENV_MAX) * (P2_H - 8) - 4;
-      const yBot = P2_TOP + P2_H - 4;
-      if (!started) { ctx.moveTo(x, yBot); started = true; }
-      ctx.lineTo(x, yTop);
+      const y = valToY(Math.min(d.v, ENV_MAX), 0, ENV_MAX, 2);
+      if (!started) { ctx.moveTo(x, baseY2); started = true; }
+      ctx.lineTo(x, y);
     }
-    // close back along bottom
     for (let i = tiltEnvData.length - 1; i >= 0; i--) {
       const x = tToX(tiltEnvData[i].t);
       if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
-      ctx.lineTo(x, P2_TOP + P2_H - 4);
+      ctx.lineTo(x, baseY2);
       break;
     }
     ctx.closePath();
@@ -1323,29 +1316,10 @@ function draw() {
     for (const d of tiltEnvData) {
       const x = tToX(d.t);
       if (x < MARGIN.left || x > MARGIN.left + plotW) continue;
-      const y = P2_TOP + P2_H - (Math.min(d.v, ENV_MAX) / ENV_MAX) * (P2_H - 8) - 4;
+      const y = valToY(Math.min(d.v, ENV_MAX), 0, ENV_MAX, 2);
       if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
     }
     ctx.stroke();
-    ctx.restore();
-
-    // Right Y-axis label for envelope (degrees)
-    ctx.save();
-    ctx.fillStyle = theme.tiltEnvLine;
-    ctx.font = '10px IBM Plex Mono, monospace';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    const envTopY = P2_TOP + 4;
-    const envBotY = P2_TOP + P2_H - 4;
-    ctx.fillText(ENV_MAX.toFixed(1) + '°', MARGIN.left + plotW + 4, envTopY);
-    ctx.fillText('0°', MARGIN.left + plotW + 4, envBotY);
-    ctx.restore();
-
-    // Tilt resp rate as dashed line
-    ctx.save();
-    ctx.setLineDash([4, 3]);
-    drawLine(tiltRRData, 't', 'v', RR_MIN, RR_MAX, 2, theme.tiltResp, 1.2);
-    ctx.setLineDash([]);
     ctx.restore();
   }
 
@@ -1617,7 +1591,6 @@ chartArea.addEventListener('mousemove', (e) => {
   const sp = findNearest(spo2Data, t);
   const hr = findNearest(hrData, t);
   const hrm = findNearest(hrMA, t);
-  const rr = findNearest(rrData, t);
   const mo = findNearest(motData, t);
 
   let apnStr = '';
@@ -1636,12 +1609,9 @@ chartArea.addEventListener('mousemove', (e) => {
     const ecg = findNearest(ecgHRData, t);
     if (ecg) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.ecgHR}"></div>ECG HR: ${ecg.v} bpm</div>`;
   }
-  if (rr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.resp}"></div>Resp: ${rr.v} br/min</div>`;
   if (hasTilt) {
-    const trr = findNearest(tiltRRData, t);
     const tenv = findNearest(tiltEnvData, t);
-    if (trr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.tiltResp}"></div>Tilt Resp: ${trr.v.toFixed(1)} br/min</div>`;
-    if (tenv) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.tiltEnvLine}"></div>Envelope: ${tenv.v.toFixed(2)}°</div>`;
+    if (tenv) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.tiltEnvLine}"></div>Breath amp: ${tenv.v.toFixed(2)}°</div>`;
   }
   if (mo && mo.v > 0) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.motionAxis}"></div>Motion: ${mo.v}</div>`;
   if (hasRoll) {
