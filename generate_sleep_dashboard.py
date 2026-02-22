@@ -330,7 +330,7 @@ def read_tilt_breath(filepath, ref_date):
     return {'tiltRR': tilt_rr, 'tiltEnv': tilt_env, 'tiltRoll': tilt_roll}
 
 
-def read_ecg_beats(filepath, ref_date, bin_seconds=4, pleth_delay_s=0.25):
+def read_ecg_beats(filepath, ref_date, bin_seconds=2, pleth_delay_s=0.25):
     """Read ECG beats CSV and compute causal median-3 smoothed HR, resampled to bin_seconds.
     Beat timestamps are Unix epoch UTC; output t is minutes since local midnight (PST = UTC-8).
     Keeps artifact-flagged beats — they are real heartbeats, just unusual.
@@ -631,9 +631,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="legend" id="legendBar">
   <div class="legend-item"><div class="legend-swatch" id="lsw-spo2" style="background:#48b8e8"></div>SpO&#x2082; (%)</div>
-  <div class="legend-item"><div class="legend-swatch" id="lsw-hr" style="background:#e85878"></div>Heart Rate (bpm)</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-hr" style="background:rgba(232,88,120,0.45); border-top: 2px dashed rgba(232,88,120,0.55); height:0; width:18px;"></div>Pleth HR</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-hrma" style="background:rgba(255,220,80,0.85)"></div>HR Trend (~5m avg)</div>
-  <div class="legend-item"><div class="legend-swatch" id="lsw-ecghr" style="background:rgba(80,220,190,0.9)"></div>ECG HR (med-3)</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-ecghr" style="background:#e83030"></div>ECG HR (med-3)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-tiltenv" style="background:rgba(64,208,208,0.4)"></div>Breath Envelope (°)</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnea" style="background:rgba(255,80,60,0.5)"></div>Apnea</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-apnealong" style="background:rgba(255,220,40,0.8)"></div>Apnea &gt;50s</div>
@@ -679,7 +679,7 @@ const THEMES = {
     xAxisText: '#5a6a7a',
     xAxisLine: '#1a2430',
     spo2: '#48b8e8',
-    hr: '#e85878',
+    hr: 'rgba(232,88,120,0.45)',
     resp: '#58d888',
     respArea: 'rgba(88,216,136,0.12)',
     spo2Ref: 'rgba(255,80,60,0.3)',
@@ -692,10 +692,10 @@ const THEMES = {
     motionBar: 'rgba(160,140,220,0.7)',
     motionAxis: 'rgba(160,140,220,0.7)',
     tiltResp: '#40d0d0',
-    tiltEnv: 'rgba(64,208,208,0.15)',
-    tiltEnvLine: 'rgba(64,208,208,0.4)',
+    tiltEnv: 'rgba(64,208,208,0.35)',
+    tiltEnvLine: 'rgba(64,208,208,0.85)',
     hrMA: 'rgba(255,220,80,0.85)',
-    ecgHR: 'rgba(80,220,190,0.9)',
+    ecgHR: '#e83030',
     apneaLong: 'rgba(255,220,40,0.8)',
     apneaLongText: '#ffe060',
     spo2DipText: '#ff6060',
@@ -719,7 +719,7 @@ const THEMES = {
     xAxisText: '#444444',
     xAxisLine: '#999999',
     spo2: '#0077aa',
-    hr: '#cc2244',
+    hr: 'rgba(180,40,70,0.4)',
     resp: '#228844',
     respArea: 'rgba(34,136,68,0.10)',
     spo2Ref: 'rgba(200,50,30,0.4)',
@@ -732,10 +732,10 @@ const THEMES = {
     motionBar: 'rgba(80,60,160,0.65)',
     motionAxis: 'rgba(80,60,140,0.8)',
     tiltResp: '#008888',
-    tiltEnv: 'rgba(0,136,136,0.10)',
-    tiltEnvLine: 'rgba(0,136,136,0.35)',
+    tiltEnv: 'rgba(0,136,136,0.28)',
+    tiltEnvLine: 'rgba(0,136,136,0.80)',
     hrMA: 'rgba(180,120,0,0.85)',
-    ecgHR: 'rgba(0,140,120,0.9)',
+    ecgHR: '#cc0000',
     apneaLong: 'rgba(200,160,0,0.75)',
     apneaLongText: '#806000',
     spo2DipText: '#cc0000',
@@ -748,7 +748,9 @@ let theme = THEMES.dark;
 
 function updateLegendColors() {
   document.getElementById('lsw-spo2').style.background = theme.spo2;
-  document.getElementById('lsw-hr').style.background = theme.hr;
+  const hrEl = document.getElementById('lsw-hr');
+  hrEl.style.background = 'none';
+  hrEl.style.borderTop = '2px dashed ' + theme.hr.replace(/[\d.]+\)$/, '0.8)');
   document.getElementById('lsw-hrma').style.background = theme.hrMA;
   const ecgHREl = document.getElementById('lsw-ecghr');
   if (ecgHREl) ecgHREl.style.background = theme.ecgHR;
@@ -1264,15 +1266,15 @@ function draw() {
   }
 
   // Panel 1: HR
-  drawYAxis(HR_MIN, HR_MAX, 1, hrTicks, 'HR bpm', theme.hr);
-  drawLine(hrData, 't', 'v', HR_MIN, HR_MAX, 1, theme.hr, 1.0);
+  drawYAxis(HR_MIN, HR_MAX, 1, hrTicks, 'HR bpm', theme.ecgHR);
+  ctx.save();
+  ctx.setLineDash([4, 3]);
+  drawLine(hrData, 't', 'v', HR_MIN, HR_MAX, 1, theme.hr, 1.2);
+  ctx.setLineDash([]);
+  ctx.restore();
   drawLine(hrMA,   't', 'v', HR_MIN, HR_MAX, 1, theme.hrMA, 2.0);
   if (hasEcgHR) {
-    ctx.save();
-    ctx.setLineDash([4, 3]);
-    drawLine(ecgHRData, 't', 'v', HR_MIN, HR_MAX, 1, theme.ecgHR, 1.2);
-    ctx.setLineDash([]);
-    ctx.restore();
+    drawLine(ecgHRData, 't', 'v', HR_MIN, HR_MAX, 1, theme.ecgHR, 1.0);
   }
 
   // Panel 2: Breath Envelope amplitude only
@@ -1603,7 +1605,7 @@ chartArea.addEventListener('mousemove', (e) => {
 
   let html = `<div class="tt-time">${minToClockStrFull(t)}</div>`;
   if (sp) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.spo2}"></div>SpO\u2082: ${sp.v}%</div>`;
-  if (hr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hr}"></div>HR: ${hr.v} bpm</div>`;
+  if (hr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hr}"></div>Pleth HR: ${hr.v} bpm</div>`;
   if (hrm) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hrMA}"></div>HR avg: ${hrm.v} bpm</div>`;
   if (hasEcgHR) {
     const ecg = findNearest(ecgHRData, t);
