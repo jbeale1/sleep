@@ -20,11 +20,13 @@ import os
 import sys
 import csv
 import json
+import bisect
+import calendar
 import glob
 from datetime import datetime, timedelta
 
-VERSION = "1.5.3"
-BUILD_DATE = "2026-02-13"
+VERSION = "1.6.0"
+BUILD_DATE = "2026-02-22"
 
 
 def find_input_files(input_dir):
@@ -80,6 +82,14 @@ def find_input_files(input_dir):
         files['tilt_breath'] = breath_matches[-1]
         if len(breath_matches) > 1:
             print(f"  Note: found {len(breath_matches)} breath files, using {os.path.basename(breath_matches[-1])}")
+
+    # Optional: ECG beats file (e.g. ECG_20260221_225814_beats.csv)
+    ecg_pattern = os.path.join(input_dir, "ECG_*_beats.csv")
+    ecg_matches = sorted(glob.glob(ecg_pattern))
+    if ecg_matches:
+        files['ecg_beats'] = ecg_matches[-1]
+        if len(ecg_matches) > 1:
+            print(f"  Note: found {len(ecg_matches)} ECG beats files, using {os.path.basename(ecg_matches[-1])}")
 
     return files
 
@@ -320,6 +330,78 @@ def read_tilt_breath(filepath, ref_date):
     return {'tiltRR': tilt_rr, 'tiltEnv': tilt_env, 'tiltRoll': tilt_roll}
 
 
+def read_ecg_beats(filepath, ref_date, bin_seconds=4, pleth_delay_s=0.25):
+    """Read ECG beats CSV and compute causal median-3 smoothed HR, resampled to bin_seconds.
+    Beat timestamps are Unix epoch UTC; output t is minutes since local midnight (PST = UTC-8).
+    Keeps artifact-flagged beats — they are real heartbeats, just unusual.
+    Returns list of [t_minutes, hr_bpm] pairs, or [] on error."""
+    # Epoch of PST (UTC-8) midnight for ref_date
+    utc_midnight_epoch = calendar.timegm(ref_date.timetuple())
+    local_midnight_epoch = utc_midnight_epoch + 8 * 3600  # PST midnight = UTC 08:00
+
+    beats = []  # (pleth_arrival_epoch_s, rr_ms)
+    try:
+        with open(filepath, newline='') as f:
+            lines = [l for l in f if not l.startswith('#')]
+        reader = csv.DictReader(lines)
+        for row in reader:
+            try:
+                epoch_s = float(row['epoch_s']) + pleth_delay_s
+                rr_ms = float(row['rr_ms'])
+            except (ValueError, KeyError):
+                continue
+            if not (100 < rr_ms < 3000):
+                continue
+            beats.append((epoch_s, rr_ms))
+    except OSError:
+        return []
+
+    if len(beats) < 4:
+        return []
+
+    beat_times = [b[0] for b in beats]
+
+    # Step 1: 1-Hz grid of last-cycle instantaneous HR
+    t_start = beat_times[0]
+    t_end   = beat_times[-1]
+    grid_1hz = []
+    t = t_start + 1.0
+    while t <= t_end:
+        idx = bisect.bisect_right(beat_times, t) - 1
+        if idx >= 1:
+            iv = (beat_times[idx] - beat_times[idx - 1]) * 1000.0
+            grid_1hz.append(60000.0 / iv if 300 < iv < 3000 else None)
+        else:
+            grid_1hz.append(None)
+        t += 1.0
+
+    if not grid_1hz:
+        return []
+
+    # Step 2: causal median-3 spike filter
+    # A single corrupted pleth cycle (missed or doubled pulse) produces one outlier
+    # sample; taking median of 3 consecutive values removes it without smoothing
+    # genuine HR changes that persist across 2+ seconds.
+    med3 = list(grid_1hz)
+    for i in range(2, len(med3)):
+        window = [v for v in [grid_1hz[i - 2], grid_1hz[i - 1], grid_1hz[i]] if v is not None]
+        if len(window) >= 2:
+            med3[i] = sorted(window)[len(window) // 2]
+
+    # Step 3: resample to bin_seconds by averaging, to match the oximeter output rate
+    result = []
+    n = len(med3)
+    for j in range(0, n, bin_seconds):
+        chunk = med3[j:j + bin_seconds]
+        vals = [v for v in chunk if v is not None]
+        if vals:
+            epoch_bin = t_start + 1.0 + j
+            t_min = (epoch_bin - local_midnight_epoch) / 60.0
+            result.append([round(t_min, 4), round(sum(vals) / len(vals), 1)])
+
+    return result
+
+
 def compute_time_range(sleepu, rr):
     """Return (t_min, t_max) with some padding, and formatted subtitle info."""
     t0 = sleepu['t0']
@@ -551,6 +633,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="legend-item"><div class="legend-swatch" id="lsw-spo2" style="background:#48b8e8"></div>SpO&#x2082; (%)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-hr" style="background:#e85878"></div>Heart Rate (bpm)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-hrma" style="background:rgba(255,220,80,0.85)"></div>HR Trend (~5m avg)</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-ecghr" style="background:rgba(80,220,190,0.9)"></div>ECG HR (med-3)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-resp" style="background:#58d888"></div>Resp. Rate (br/min)</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-tiltrr" style="background:#40d0d0"></div>Tilt Resp. Rate</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-tiltenv" style="background:rgba(64,208,208,0.4)"></div>Breath Envelope (°)</div>
@@ -614,6 +697,7 @@ const THEMES = {
     tiltEnv: 'rgba(64,208,208,0.15)',
     tiltEnvLine: 'rgba(64,208,208,0.4)',
     hrMA: 'rgba(255,220,80,0.85)',
+    ecgHR: 'rgba(80,220,190,0.9)',
     apneaLong: 'rgba(255,220,40,0.8)',
     apneaLongText: '#ffe060',
     spo2DipText: '#ff6060',
@@ -653,6 +737,7 @@ const THEMES = {
     tiltEnv: 'rgba(0,136,136,0.10)',
     tiltEnvLine: 'rgba(0,136,136,0.35)',
     hrMA: 'rgba(180,120,0,0.85)',
+    ecgHR: 'rgba(0,140,120,0.9)',
     apneaLong: 'rgba(200,160,0,0.75)',
     apneaLongText: '#806000',
     spo2DipText: '#cc0000',
@@ -667,6 +752,8 @@ function updateLegendColors() {
   document.getElementById('lsw-spo2').style.background = theme.spo2;
   document.getElementById('lsw-hr').style.background = theme.hr;
   document.getElementById('lsw-hrma').style.background = theme.hrMA;
+  const ecgHREl = document.getElementById('lsw-ecghr');
+  if (ecgHREl) ecgHREl.style.background = theme.ecgHR;
   document.getElementById('lsw-resp').style.background = theme.resp;
   const tiltRREl = document.getElementById('lsw-tiltrr');
   if (tiltRREl) tiltRREl.style.background = theme.tiltResp;
@@ -965,8 +1052,10 @@ const obstrData = RAW.obstr.map(d => ({t: d[0], dur: d[1], sev: d[2]}));
 const tiltRRData  = (RAW.tiltRR  || []).map(d => ({t: d[0], v: d[1]}));
 const tiltEnvData = (RAW.tiltEnv || []).map(d => ({t: d[0], v: d[1]}));
 const tiltRollData = (RAW.tiltRoll || []).map(d => ({t: d[0], v: d[1]}));
-const hasTilt = tiltRRData.length > 0;
-const hasRoll = tiltRollData.length > 0;
+const ecgHRData   = (RAW.ecgHR   || []).map(d => ({t: d[0], v: d[1]}));
+const hasTilt  = tiltRRData.length > 0;
+const hasRoll  = tiltRollData.length > 0;
+const hasEcgHR = ecgHRData.length > 0;
 
 // Map roll angle to color using full rainbow, auto-scaled to data range.
 // Computed range from actual data gives maximum contrast for small shifts.
@@ -993,13 +1082,13 @@ function rollToColor(angle, alpha) {
 // Compute dynamic Y-axis ranges from data
 // ============================================================
 const spo2Vals = spo2Data.map(d => d.v);
-const hrVals = hrData.map(d => d.v);
+const hrVals = hrData.map(d => d.v).concat(ecgHRData.map(d => d.v));
 const rrVals = rrData.map(d => d.v);
 
 const SPO2_MIN = Math.max(70, Math.min(...spo2Vals) - 2);
 const SPO2_MAX = 100;
 const HR_MIN = Math.max(30, Math.floor((Math.min(...hrVals) - 3) / 5) * 5);
-const HR_MAX = Math.min(200, Math.ceil((Math.max(...hrVals) + 3) / 5) * 5);
+const HR_MAX = Math.min(150, Math.ceil((Math.max(...hrVals) + 3) / 5) * 5);
 const RR_MIN = 0;
 const allRRVals = rrVals.concat(tiltRRData.map(d => d.v));
 const RR_MAX = Math.ceil((Math.max(...allRRVals) + 2) / 5) * 5;
@@ -1182,7 +1271,14 @@ function draw() {
   // Panel 1: HR
   drawYAxis(HR_MIN, HR_MAX, 1, hrTicks, 'HR bpm', theme.hr);
   drawLine(hrData, 't', 'v', HR_MIN, HR_MAX, 1, theme.hr, 1.0);
-  drawLine(hrMA, 't', 'v', HR_MIN, HR_MAX, 1, theme.hrMA, 2.0);
+  drawLine(hrMA,   't', 'v', HR_MIN, HR_MAX, 1, theme.hrMA, 2.0);
+  if (hasEcgHR) {
+    ctx.save();
+    ctx.setLineDash([4, 3]);
+    drawLine(ecgHRData, 't', 'v', HR_MIN, HR_MAX, 1, theme.ecgHR, 1.2);
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
 
   // Panel 2: Respiratory Rate
   drawYAxis(RR_MIN, RR_MAX, 2, rrTicks, 'Resp br/m', theme.resp);
@@ -1536,6 +1632,10 @@ chartArea.addEventListener('mousemove', (e) => {
   if (sp) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.spo2}"></div>SpO\u2082: ${sp.v}%</div>`;
   if (hr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hr}"></div>HR: ${hr.v} bpm</div>`;
   if (hrm) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.hrMA}"></div>HR avg: ${hrm.v} bpm</div>`;
+  if (hasEcgHR) {
+    const ecg = findNearest(ecgHRData, t);
+    if (ecg) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.ecgHR}"></div>ECG HR: ${ecg.v} bpm</div>`;
+  }
   if (rr) html += `<div class="tt-row"><div class="tt-dot" style="background:${theme.resp}"></div>Resp: ${rr.v} br/min</div>`;
   if (hasTilt) {
     const trr = findNearest(tiltRRData, t);
@@ -1934,6 +2034,12 @@ def main():
             print(f"  Tilt envelope samples: {len(tilt_data['tiltEnv'])}")
             print(f"  Tilt roll samples: {len(tilt_data['tiltRoll'])}")
 
+    # Optional ECG-derived heart rate (median-3 smoothed, resampled to oximeter bin rate)
+    ecg_hr = []
+    if 'ecg_beats' in files:
+        ecg_hr = read_ecg_beats(files['ecg_beats'], ref_date)
+        print(f"  ECG beats HR samples: {len(ecg_hr)}")
+
     # -> New: compute apnea counts for dashboard (seconds)
     apnea_count_gt10 = sum(1 for a in apnea if a[1] > 10.0)
     apnea_count_gt50 = sum(1 for a in apnea if a[1] > 50.0)
@@ -2032,6 +2138,7 @@ def main():
         'rr': rr,
         'apnea': apnea,
         'obstr': obstr,
+        'ecgHR': ecg_hr,
     }
     if tilt_data:
         data['tiltRR'] = tilt_data['tiltRR']
