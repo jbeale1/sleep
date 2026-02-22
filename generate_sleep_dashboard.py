@@ -25,7 +25,7 @@ import calendar
 import glob
 from datetime import datetime, timedelta
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 BUILD_DATE = "2026-02-22"
 
 
@@ -90,6 +90,11 @@ def find_input_files(input_dir):
         files['ecg_beats'] = ecg_matches[-1]
         if len(ecg_matches) > 1:
             print(f"  Note: found {len(ecg_matches)} ECG beats files, using {os.path.basename(ecg_matches[-1])}")
+
+    # Optional: periodic breathing report (produced by detect_periodic_breathing.py)
+    pb_path = os.path.join(input_dir, "periodic_breathing_report.csv")
+    if os.path.isfile(pb_path):
+        files['pb_report'] = pb_path
 
     return files
 
@@ -402,6 +407,22 @@ def read_ecg_beats(filepath, ref_date, bin_seconds=2, pleth_delay_s=0.25):
     return result
 
 
+def read_pb_report(filepath, ref_date):
+    """Read periodic_breathing_report.csv.
+    Returns list of [t_start_min, t_end_min] pairs in minutes-since-midnight."""
+    episodes = []
+    ref_midnight = datetime.combine(ref_date, datetime.min.time())
+    with open(filepath, newline='') as f:
+        for row in csv.DictReader(f):
+            try:
+                t0 = float(row['t_start_min'])
+                t1 = float(row['t_end_min'])
+            except (ValueError, KeyError):
+                continue
+            episodes.append([round(t0, 2), round(t1, 2)])
+    return episodes
+
+
 def compute_time_range(sleepu, rr):
     """Return (t_min, t_max) with some padding, and formatted subtitle info."""
     t0 = sleepu['t0']
@@ -641,6 +662,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-roll" style="background:linear-gradient(to right, hsl(240,75%,55%), hsl(180,75%,55%), hsl(120,75%,55%), hsl(60,75%,55%), hsl(0,75%,55%)); border-radius:2px;"></div>Body Roll (°)</div>
   <div class="legend-item"><div class="legend-swatch bar" id="lsw-mot" style="background:rgba(160,140,220,0.5)"></div>Motion</div>
   <div class="legend-item"><div class="legend-swatch" id="lsw-good" style="background:rgba(80,200,120,0.5); border-top: 2px dotted rgba(80,200,120,0.8); height:0; width:18px;"></div>Restful (&ge;15m)</div>
+  <div class="legend-item"><div class="legend-swatch" id="lsw-pb" style="border-top: 2px dashed rgba(60,100,220,0.90); height:0; width:18px;"></div>Periodic Breathing</div>
 </div>
 
 <div class="chart-container" id="chartArea">
@@ -700,6 +722,7 @@ const THEMES = {
     apneaLongText: '#ffe060',
     spo2DipText: '#ff6060',
     goodSleep: 'rgba(80,200,120,0.5)',
+    pbEpisode: 'rgba(60,100,220,0.90)',
     ahiHourlyText: 'rgba(255,255,255,0.85)',
     rollAxis: 'rgba(200,180,140,0.7)',
   },
@@ -740,6 +763,7 @@ const THEMES = {
     apneaLongText: '#806000',
     spo2DipText: '#cc0000',
     goodSleep: 'rgba(40,160,80,0.45)',
+    pbEpisode: 'rgba(40,80,200,0.85)',
     ahiHourlyText: 'rgba(0,0,0,0.8)',
     rollAxis: 'rgba(120,100,60,0.8)',
   }
@@ -764,6 +788,8 @@ function updateLegendColors() {
   const goodEl = document.getElementById('lsw-good');
   goodEl.style.background = 'none';
   goodEl.style.borderTop = '2px dotted ' + theme.goodSleep;
+  const pbEl = document.getElementById('lsw-pb');
+  if (pbEl) { pbEl.style.background = 'none'; pbEl.style.borderTop = '2px dashed ' + theme.pbEpisode; }
 }
 
 function toggleTheme() {
@@ -1049,6 +1075,7 @@ const obstrData = RAW.obstr.map(d => ({t: d[0], dur: d[1], sev: d[2]}));
 const tiltRRData  = (RAW.tiltRR  || []).map(d => ({t: d[0], v: d[1]}));
 const tiltEnvData = (RAW.tiltEnv || []).map(d => ({t: d[0], v: d[1]}));
 const tiltRollData = (RAW.tiltRoll || []).map(d => ({t: d[0], v: d[1]}));
+const pbEpisodes  = (RAW.pbEpisodes || []);  // [{t0, t1}] in minutes
 const ecgHRData   = (RAW.ecgHR   || []).map(d => ({t: d[0], v: d[1]}));
 const hasTilt  = tiltEnvData.length > 0;
 const hasRoll  = tiltRollData.length > 0;
@@ -1211,9 +1238,10 @@ for (let i = 0; i <= hrData.length; i++) {
 }
 
 // Append restful total to subtitle
-const restfulTotal = Math.round(goodPeriods.reduce((s, gp) => s + (gp.t1 - gp.t0), 0));
+const restfulTotalMin = goodPeriods.reduce((s, gp) => s + (gp.t1 - gp.t0), 0);
+const restfulTotalHrs = (restfulTotalMin / 60).toFixed(1);
 document.querySelector('.subtitle').insertAdjacentHTML('beforeend',
-  ` \u00a0\u00a0\u2022 \u00a0Restful: ${restfulTotal}m`);
+  ` \u00a0\u00a0\u2022 \u00a0Restful: ${restfulTotalHrs}h`);
 
 // Generate tick arrays
 function makeTicks(lo, hi, step) {
@@ -1322,6 +1350,25 @@ function draw() {
       if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
     }
     ctx.stroke();
+
+    // Periodic breathing episode indicators: dashed line at 90 % of ENV_MAX
+    if (pbEpisodes.length > 0) {
+      const pbY = valToY(ENV_MAX * 0.90, 0, ENV_MAX, 2);
+      ctx.strokeStyle = theme.pbEpisode;
+      ctx.lineWidth = 2.0;
+      ctx.setLineDash([8, 4]);
+      for (const ep of pbEpisodes) {
+        const x0 = Math.max(tToX(ep.t0), MARGIN.left);
+        const x1 = Math.min(tToX(ep.t1), MARGIN.left + plotW);
+        if (x1 <= x0) continue;
+        ctx.beginPath();
+        ctx.moveTo(x0, pbY);
+        ctx.lineTo(x1, pbY);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    }
+
     ctx.restore();
   }
 
@@ -2006,6 +2053,12 @@ def main():
             print(f"  Tilt envelope samples: {len(tilt_data['tiltEnv'])}")
             print(f"  Tilt roll samples: {len(tilt_data['tiltRoll'])}")
 
+    # Optional periodic breathing report
+    pb_episodes = []
+    if 'pb_report' in files:
+        pb_episodes = read_pb_report(files['pb_report'], ref_date)
+        print(f"  Periodic breathing episodes: {len(pb_episodes)}")
+
     # Optional ECG-derived heart rate (median-3 smoothed, resampled to oximeter bin rate)
     ecg_hr = []
     if 'ecg_beats' in files:
@@ -2091,16 +2144,23 @@ def main():
     if last_t >= 1440:
         end_date = ref_date + timedelta(days=1)
 
+    # Condense oximeter label: "Checkme O2 Ultra" -> "Checkme", "SleepU" -> "SleepU"
+    oximeter_short = oximeter_label.split()[0] if oximeter_label else oximeter_label
+
     subtitle = (f"{ref_date.strftime('%Y-%m-%d')} {minutes_to_clock(first_t)} "
                 f"&rarr; {end_date.strftime('%Y-%m-%d')} {minutes_to_clock(last_t)} "
-                f"&nbsp;&middot;&nbsp; {format_duration(first_t, last_t)} recording"
-                f" &nbsp;&middot;&nbsp; {oximeter_label}")
+                f"&nbsp;&middot;&nbsp; {format_duration(first_t, last_t)}"
+                f" &nbsp;&middot;&nbsp; {oximeter_short}")
     # append apnea summary to subtitle for the dashboard (only if breathing data available)
     has_breathing = bool(apnea or obstr or rr)
     if has_breathing:
-        subtitle += f" &nbsp;&nbsp; • &nbsp;Apneas &gt;10s: {apnea_count_gt10}, &gt;50s: {apnea_count_gt50}"
-        subtitle += f" &nbsp;&nbsp; • &nbsp;ODI(3%): {odi_3pct}/hr, ODI(4%): {odi_4pct}/hr"
-    subtitle += f" &nbsp;&nbsp; • &nbsp;SpO\u2082&lt;90%: {time_below_90_min}m"
+        subtitle += f" &nbsp;&middot;&nbsp; Apneas &gt;10s: {apnea_count_gt10}, &gt;50s: {apnea_count_gt50}"
+        subtitle += f" &nbsp;&middot;&nbsp; ODI(3%): {odi_3pct}/hr, ODI(4%): {odi_4pct}/hr"
+    subtitle += f" &nbsp;&middot;&nbsp; SpO\u2082&lt;90%: {time_below_90_min}m"
+    if pb_episodes:
+        pb_total_min = sum(e[1] - e[0] for e in pb_episodes)
+        pb_hours = pb_total_min / 60.0
+        subtitle += f" &nbsp;&middot;&nbsp; PB: {pb_hours:.1f}h"
 
     title_date = end_date.strftime('%Y-%m-%d')
 
@@ -2116,6 +2176,8 @@ def main():
         data['tiltRR'] = tilt_data['tiltRR']
         data['tiltEnv'] = tilt_data['tiltEnv']
         data['tiltRoll'] = tilt_data.get('tiltRoll', [])
+    if pb_episodes:
+        data['pbEpisodes'] = [{'t0': e[0], 't1': e[1]} for e in pb_episodes]
     data_json = json.dumps(data, separators=(',', ':'))
 
     # SpO2 threshold for "Restful" detection: lower by 1% for Checkme
