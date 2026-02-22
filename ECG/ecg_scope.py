@@ -1017,6 +1017,30 @@ class BeatScope:
 
         r_amp = r_amps[0] if r_amps else 0
 
+        # T/R ratio: T amplitude (100-400ms post-R) / R amplitude
+        tr_str = ''
+        if single:
+            # Define T-wave search window (same as _compute_tr_data)
+            T_SEARCH_LO_MS = 100
+            T_SEARCH_HI_MS = 400
+            BL_LO_MS = -300
+            BL_HI_MS = -200
+            t_lo = pre_samp + int(T_SEARCH_LO_MS * FS / 1000)
+            t_hi = pre_samp + int(T_SEARCH_HI_MS * FS / 1000)
+            bl_lo = pre_samp + int(BL_LO_MS * FS / 1000)
+            bl_hi = pre_samp + int(BL_HI_MS * FS / 1000)
+            
+            if not np.any(np.isnan(beat)):
+                baseline = np.mean(beat[bl_lo:bl_hi])
+                r_amp_baseline = beat[pre_samp] - baseline
+                
+                if abs(r_amp_baseline) > 50:  # MIN_R_UV threshold from _compute_tr_data
+                    t_region = beat[t_lo:t_hi] - baseline
+                    t_peak_idx = np.argmax(np.abs(t_region))
+                    t_amp = t_region[t_peak_idx]
+                    tr_ratio = t_amp / r_amp_baseline
+                    tr_str = f'  T/R: {tr_ratio:.2f}'
+
         # Noise metric: RMS of highpass-filtered (current beat − rolling average)
         # Highpass removes slow baseline wander; keeps HF texture noise
         noise_str = ''
@@ -1045,6 +1069,7 @@ class BeatScope:
             f'{wall_str}  '
             f'R-R: {rr_ms}ms  HR: {hr}bpm  '
             f'QRS: {r_amp:.0f}\u00b5V'
+            f'{tr_str}'
             f'{noise_str}'
         )
 
@@ -1070,46 +1095,49 @@ class BeatScope:
         self.update()
 
     def on_key(self, event):
-        if event.key in ('right', 'd'):
+        # Normalize key to lowercase for case-insensitive handling
+        key = event.key.lower() if event.key else None
+        
+        if key in ('right', 'd'):
             self.goto(self.idx + 1)
-        elif event.key in ('shift+right', 'D'):
+        elif key in ('shift+right', 'shift+d'):
             self.goto(self.idx + 10)
-        elif event.key in ('left', 'a'):
+        elif key in ('left', 'a'):
             self.goto(self.idx - 1)
-        elif event.key in ('shift+left', 'A'):
+        elif key in ('shift+left', 'shift+a'):
             self.goto(self.idx - 10)
-        elif event.key == 'home':
+        elif key == 'home':
             self._reset_tl_zoom()
             self.goto(0)
-        elif event.key == 'end':
+        elif key == 'end':
             self.goto(n_beats - 1)
-        elif event.key == 'up':
+        elif key == 'up':
             self.avg_window = min(100, self.avg_window + 5)
             self._noise_timeline = None
             self._tr_cache = None
             if self.tl_mode == 'noise':
                 self._draw_timeline()
             self.update()
-        elif event.key == 'down':
+        elif key == 'down':
             self.avg_window = max(2, self.avg_window - 5)
             self._noise_timeline = None
             self._tr_cache = None
             if self.tl_mode == 'noise':
                 self._draw_timeline()
             self.update()
-        elif event.key == 'g':
+        elif key == 'g':
             self.show_ghost = not self.show_ghost
             self.update()
-        elif event.key == 't':
+        elif key == 't':
             self.show_persist = not self.show_persist
             self.update()
-        elif event.key == 'r':
+        elif key == 'r':
             self.show_avg = not self.show_avg
             self.update()
-        elif event.key == 'p':
+        elif key == 'p':
             self.show_pwave = not self.show_pwave
             self.update()
-        elif event.key == 'f':
+        elif key == 'f':
             self.use_filter = not self.use_filter
             self.data = ecg_filtered if self.use_filter else data_raw
             self.update()
@@ -1119,21 +1147,21 @@ class BeatScope:
         elif event.key == '4':
             self.num_beats = 15
             self.update()
-        elif event.key == 'n':
+        elif key == 'n':
             self.tl_mode = 'noise' if self.tl_mode == 'hr' else 'hr'
             self._draw_timeline()
             self.fig.canvas.draw_idle()
-        elif event.key == 'h':
+        elif key == 'h':
             self._show_noise_histogram()
-        elif event.key == 'j':
+        elif key == 'j':
             self._show_tr_ratio_histogram()
-        elif event.key == 'k':
+        elif key == 'k':
             self._show_tr_analysis()
-        elif event.key == 's':
+        elif key == 's':
             fname = str(Path(CSV_FILE).parent / f"beat_{self.idx+1:04d}.png")
             self.fig.savefig(fname, dpi=150, bbox_inches='tight')
             print(f"Saved {fname}")
-        elif event.key == 'w':
+        elif key == 'w':
             # Export raw samples for the currently displayed window to CSV
             last_beat = min(self.idx + self.num_beats - 1, n_beats - 1)
             r_first = peaks[self.idx]
@@ -1146,7 +1174,7 @@ class BeatScope:
             np.savetxt(fname, segment, fmt='%.2f', header='ecg_raw_uV',
                        comments='')
             print(f"Exported {len(segment)} raw samples → {fname}")
-        elif event.key in ('q', 'escape'):
+        elif key in ('q', 'escape'):
             plt.close(self.fig)
 
 # Launch
