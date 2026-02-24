@@ -32,8 +32,8 @@ Note: first do:
 J. Beale  v1.3 2026-02-13
 """
 
-VERSION = "1.4"
-VERSION_DATE = "2026-02-20"
+VERSION = "1.5"
+VERSION_DATE = "2026-02-24"
 
 import spidev
 import time
@@ -132,6 +132,14 @@ SYNC_INTERVAL = FS_IN       # log timestamp every 1 sec of input
 FLUSH_EVERY = FS_OUT * 60   # flush to disk every minute
 STATS_INTERVAL = FS_OUT * 5 # print live stats every 5 sec
 DISCARD_IN = FS_IN * 2      # discard first 2 sec (filter settling)
+
+# Single-sample spike rejection
+# A single sample whose deviation from the midpoint of its two neighbours
+# exceeds this value is replaced by that midpoint.  Normal QRS peaks are
+# well under 10 000 µV; hardware glitches easily exceed 100 000 µV.
+SPIKE_THRESHOLD = 20000.0   # µV
+_spike_pp = None            # sample n-2 (raw µV)
+_spike_p  = None            # sample n-1 (raw µV, pending output)
 
 # =========================
 # Design filters (SOS cascade)
@@ -415,8 +423,24 @@ try:
         if raw & 0x800000:
             raw -= 1 << 24
 
-        sample_uv = raw * SCALE
+        current_uv = raw * SCALE
         in_sample_count += 1
+
+        # --- Single-sample spike rejection (1-sample lookahead delay) ---
+        # Process _spike_p (s[n-1]) now that we have its right neighbour (s[n]).
+        # Check it against the midpoint of s[n-2] and s[n]; replace if it's a spike.
+        global _spike_pp, _spike_p
+        candidate   = _spike_p      # s[n-1]: the sample about to be used
+        prev2       = _spike_pp     # s[n-2]: left neighbour for spike test
+        _spike_pp   = _spike_p      # advance state
+        _spike_p    = current_uv    # store s[n] for next iteration
+        if candidate is None:       # first sample — not enough history yet
+            continue
+        if (prev2 is not None and
+                abs(candidate - (prev2 + current_uv) / 2.0) > SPIKE_THRESHOLD):
+            sample_uv = (prev2 + current_uv) / 2.0
+        else:
+            sample_uv = candidate
 
         # --- Causal IIR filter ---
         x = np.array([sample_uv])
