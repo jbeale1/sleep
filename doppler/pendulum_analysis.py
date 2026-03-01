@@ -4,6 +4,8 @@ Usage:  python pendulum_analysis.py <IQ_csv_file> [output_png]
 If output_png is omitted the plot is displayed interactively.
 """
 
+
+VERSION = "1.3-split-plots-fixed"
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,6 +25,11 @@ SEG_STEP_S       = 60        # step between windows (s)
 SEG_MIN_AMP_MM   = 0.15      # reject windows with mean amplitude below this (mm)
 SEG_MAX_Q_FACTOR = 3.0       # reject windows where Q > this × median(Q)
 SEG_MAX_TAU_ERR  = 0.15      # reject windows where τ_err/τ exceeds this fraction
+
+# ── noise analysis configuration ─────────────────────────────────────────────
+NOISE_SMOOTH_S   = 20.0      # seconds — smoothing window for envelope/phase
+NOISE_N_HARMONICS = 10       # number of harmonics to model (fundamental + this many)
+NOISE_BP_BW_MULT = 0.15      # half-bandwidth of each harmonic bandpass, as fraction of f0
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_iq(path):
@@ -148,6 +155,64 @@ def segmented_Q(t_fit, env_fit, f0, fs):
     return seg_t, seg_A, seg_Q
 
 
+def synthesize_pendulum(disp_hp, fs, f0, n_harmonics=NOISE_N_HARMONICS):
+    """
+    Build a clean pendulum model by extracting each harmonic's slowly-varying
+    amplitude and phase via the analytic signal, smoothing both, and
+    reconstructing.  Returns the model waveform and per-harmonic info.
+    """
+    n = len(disp_hp)
+    model = np.zeros(n)
+    smooth_win = int(NOISE_SMOOTH_S * fs)
+    if smooth_win % 2 == 0:
+        smooth_win += 1
+    kernel = np.ones(smooth_win) / smooth_win
+
+    harmonic_info = []
+
+    for h in range(1, n_harmonics + 1):
+        fc = f0 * h
+        if fc >= fs / 2 * 0.9:      # skip if too close to Nyquist
+            break
+        bw = f0 * NOISE_BP_BW_MULT  # same absolute BW for each harmonic
+        f_lo = max(fc - bw, 0.05)
+        f_hi = min(fc + bw, fs / 2 * 0.95)
+        if f_hi <= f_lo:
+            break
+
+        try:
+            sos = signal.butter(4,
+                    [f_lo / (fs/2), f_hi / (fs/2)],
+                    btype='band', output='sos')
+            bp = signal.sosfiltfilt(sos, disp_hp)
+        except ValueError:
+            break
+
+        analytic = signal.hilbert(bp)
+        inst_amp   = np.abs(analytic)
+        inst_phase = np.unwrap(np.angle(analytic))
+
+        # Smooth amplitude with moving average
+        amp_smooth = np.convolve(inst_amp, kernel, mode='same')
+        # Smooth phase: fit local polynomial is better than moving average
+        # for a monotonically increasing signal.  Use moving-average on the
+        # *residual* after removing the linear trend.
+        phase_slope = (inst_phase[-1] - inst_phase[0]) / (n - 1)
+        phase_linear = inst_phase[0] + phase_slope * np.arange(n)
+        phase_resid  = inst_phase - phase_linear
+        phase_resid_smooth = np.convolve(phase_resid, kernel, mode='same')
+        phase_smooth = phase_linear + phase_resid_smooth
+
+        # Reconstruct this harmonic
+        h_model = amp_smooth * np.cos(phase_smooth)
+        model += h_model
+
+        rms = np.sqrt(np.mean(bp**2))
+        harmonic_info.append((h, fc, rms))
+
+    return model, harmonic_info
+
+
 def analyse(csv_path):
     t, I_raw, Q_raw, fs, T_total = load_iq(csv_path)
     disp_mm, lam = iq_to_displacement_mm(I_raw, Q_raw)
@@ -222,19 +287,74 @@ def analyse(csv_path):
             print(f"  Q range (segments): {seg_Q.min():.0f} – {seg_Q.max():.0f}"
                   f"  over A = {seg_A.max():.2f} – {seg_A.min():.2f} mm")
 
+    # ── noise analysis: subtract synthesized pendulum from measured ────────────
+    model, harmonic_info = synthesize_pendulum(disp_hp, fs, f0)
+    noise = disp_hp - model
+    noise_rms_mm = np.std(noise)
+    # Convert to phase noise
+    noise_rms_rad = noise_rms_mm / 1000 * (4 * np.pi) / lam
+    # Noise PSD
+    nperseg_noise = min(int(30 * fs), len(noise) // 4)
+    f_noise, psd_noise = signal.welch(noise, fs=fs, nperseg=nperseg_noise,
+                                       noverlap=nperseg_noise // 2)
+    # Signal PSD for comparison
+    _, psd_signal = signal.welch(disp_hp, fs=fs, nperseg=nperseg_noise,
+                                  noverlap=nperseg_noise // 2)
+    # Noise floor in quiet band (above last modeled harmonic)
+    last_harm_f = f0 * min(NOISE_N_HARMONICS, int(0.9 * fs/2 / f0))
+    quiet_lo = last_harm_f + f0 * 0.3
+    quiet_hi = fs / 2 * 0.8
+    quiet_mask = (f_noise >= quiet_lo) & (f_noise <= quiet_hi)
+    if quiet_mask.any():
+        noise_floor_density = np.mean(psd_noise[quiet_mask])
+    else:
+        noise_floor_density = np.mean(psd_noise)
+
+    # Time-varying noise RMS (10s windows)
+    noise_win_s = 10
+    noise_win_n = int(noise_win_s * fs)
+    noise_t_local, noise_rms_local = [], []
+    for i in range(0, len(noise) - noise_win_n, noise_win_n // 2):
+        noise_t_local.append(t[i + noise_win_n // 2])
+        noise_rms_local.append(np.std(noise[i:i + noise_win_n]))
+    noise_t_local = np.array(noise_t_local)
+    noise_rms_local = np.array(noise_rms_local)
+
+    n_harm_used = len(harmonic_info)
+    print(f"  Noise: {noise_rms_mm*1000:.1f} µm rms  ({noise_rms_rad*1000:.2f} mrad)"
+          f"  [{n_harm_used} harmonics subtracted]")
+    print(f"  Noise floor: {noise_floor_density:.2e} mm²/Hz"
+          f"  ({10*np.log10(noise_floor_density + 1e-20):.1f} dB)"
+          f"  [{quiet_lo:.1f}–{quiet_hi:.1f} Hz]")
+
     return dict(
-        t=t, t_fit=t_fit, t_p=t_p,
+        t=t, t_fit=t_fit, t_p=t_p, fs=fs,
         t_log=t_fit[:-trim],
-        disp_bp=disp_bp, env_smooth=env_smooth, env_fit=env_fit,
+        disp_hp=disp_hp, disp_bp=disp_bp,
+        env_smooth=env_smooth, env_fit=env_fit,
         A0=A0, tau=tau, tau_err=tau_err,
         f0=f0, Q_val=Q_val, Q_err=Q_err,
         log_env=log_env, log_model=log_model,
         phase_resid=phase_resid, timing_jitter=timing_jitter,
         T_total=T_total,
         seg_t=seg_t, seg_A=seg_A, seg_Q=seg_Q,
+        # noise analysis
+        model=model, noise=noise,
+        noise_rms_mm=noise_rms_mm, noise_rms_rad=noise_rms_rad,
+        f_noise=f_noise, psd_noise=psd_noise, psd_signal=psd_signal,
+        noise_floor_density=noise_floor_density,
+        noise_t_local=noise_t_local, noise_rms_local=noise_rms_local,
+        harmonic_info=harmonic_info,
     )
 
 def plot_results(r, title=''):
+    """
+    Plot results in two separate figures to improve readability:
+      - Figure 1: main analysis panels
+      - Figure 2: noise analysis panels (residual + PSD)
+    """
+    print(f"pendulum_analysis version: {VERSION}")
+
     t       = r['t']
     t_fit   = r['t_fit']
     t_p     = r['t_p']
@@ -243,19 +363,22 @@ def plot_results(r, title=''):
 
     t_model = np.linspace(t_fit[0], t_fit[-1], 2000)
 
-    seg_t = r['seg_t'];  seg_A = r['seg_A'];  seg_Q = r['seg_Q']
+    seg_t = r.get('seg_t', np.array([]))
+    seg_A = r.get('seg_A', np.array([]))
+    seg_Q = r.get('seg_Q', np.array([]))
     has_seg = len(seg_Q) >= 4
 
-    nrows = 4 if has_seg else 3
-    fig, axes = plt.subplots(nrows, 1, figsize=(12, 4*nrows + 1),
-                             layout='constrained')
-    fig.suptitle(title, fontsize=11, fontweight='bold')
+    # ================= FIGURE 1 — MAIN ANALYSIS =================
+    nrows_main = 4 if has_seg else 3
+    fig1, axes1 = plt.subplots(nrows_main, 1, figsize=(12, 4*nrows_main + 1),
+                               layout='constrained')
+    fig1.suptitle(title + "  (Main Analysis)", fontsize=11, fontweight='bold')
 
-    # ── panel 1: amplitude decay ──────────────────────────────────────────────
-    ax = axes[0]
-    ax.plot(t, r['disp_bp'],   color='steelblue', lw=0.35, alpha=0.65,
+    # Panel 1: amplitude decay
+    ax = axes1[0]
+    ax.plot(t, r['disp_bp'], color='steelblue', lw=0.35, alpha=0.65,
             label='Bandpass displacement')
-    ax.plot(t, r['env_smooth'],  color='r', lw=1.5,  label='Envelope')
+    ax.plot(t, r['env_smooth'], color='r', lw=1.5, label='Envelope')
     ax.plot(t, -r['env_smooth'], color='r', lw=1.5)
     ax.plot(t_model,  exp_decay(t_model, A0, tau), 'k--', lw=1.8,
             label=f'Fit: A₀={A0:.3f} mm, τ={tau:.0f}±{tau_err:.0f} s, Q={Q_val:.0f}±{Q_err:.0f}')
@@ -271,9 +394,9 @@ def plot_results(r, title=''):
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # ── panel 2: log envelope ─────────────────────────────────────────────────
-    ax = axes[1]
-    ax.plot(r['t_log'], r['log_env'],   color='steelblue', lw=0.8, label='ln(envelope)')
+    # Panel 2: log envelope
+    ax = axes1[1]
+    ax.plot(r['t_log'], r['log_env'], color='steelblue', lw=0.8, label='ln(envelope)')
     ax.plot(r['t_log'], r['log_model'], 'k--', lw=1.5,
             label=f'Linear fit  (slope = −1/τ = {-1/tau:.5f} s⁻¹)')
     ax.set_xlabel('Time (s)')
@@ -282,8 +405,8 @@ def plot_results(r, title=''):
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # ── panel 3: phase residual ───────────────────────────────────────────────
-    ax = axes[2]
+    # Panel 3: phase residual
+    ax = axes1[2]
     tj_ms = r['timing_jitter'] * 1000
     pr_mrad = r['phase_resid'] * 1000
     ax.plot(t_p, tj_ms, color='darkorange', lw=0.6)
@@ -296,16 +419,15 @@ def plot_results(r, title=''):
     )
     ax.grid(True, alpha=0.3)
 
-    # ── panel 4: Q vs amplitude (segmented) ──────────────────────────────────
+    # Panel 4: segmented Q vs amplitude (optional)
     if has_seg:
-        ax = axes[3]
+        ax = axes1[3]
         sc = ax.scatter(seg_A, seg_Q, c=seg_t, cmap='plasma',
                         s=40, zorder=3, label=f'Local Q ({SEG_WIN_S:.0f} s window)')
-        cb = fig.colorbar(sc, ax=ax, pad=0.02)
+        cb = fig1.colorbar(sc, ax=ax, pad=0.02)
         cb.set_label('Window centre time (s)', fontsize=9)
 
-        # Fit Q = k/A (quadratic drag model) if amplitude spans > 2×
-        if seg_A.max() / seg_A.min() > 1.5:
+        if seg_A.max() / max(seg_A.min(), 1e-12) > 1.5:
             try:
                 popt_q, _ = curve_fit(lambda A, k: k/A, seg_A, seg_Q,
                                       p0=[seg_Q.mean() * seg_A.mean()])
@@ -320,13 +442,57 @@ def plot_results(r, title=''):
                    label=f'Global fit Q = {Q_val:.0f}')
         ax.set_xlabel('Mean amplitude in window (mm)')
         ax.set_ylabel('Q')
-        ax.set_title('Local Q vs Amplitude  '
-                     f'(range: {seg_Q.min():.0f} – {seg_Q.max():.0f}  '
-                     f'over A = {seg_A.max():.2f} – {seg_A.min():.2f} mm)')
+        ax.set_title('Local Q vs Amplitude')
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
-    return fig
+    # ================= FIGURE 2 — NOISE ANALYSIS =================
+    fig2, axes2 = plt.subplots(2, 1, figsize=(12, 9), layout='constrained')
+    fig2.suptitle(title + "  (Noise Analysis)", fontsize=11, fontweight='bold')
+
+    # Panel 1: noise residual time series
+    ax = axes2[0]
+    noise = r['noise']
+    noise_um = noise * 1000  # mm → µm
+    ax.plot(t, noise_um, color='gray', lw=0.2, alpha=0.5)
+    if len(r.get('noise_rms_local', [])) > 0:
+        ax.plot(r['noise_t_local'], r['noise_rms_local'] * 1000,
+                color='red', lw=1.5, label='Local RMS (10 s)')
+        ax.plot(r['noise_t_local'], -r['noise_rms_local'] * 1000,
+                color='red', lw=1.5)
+        ax.legend(fontsize=9)
+    n_harm = len(r.get('harmonic_info', []))
+    rms_um = r['noise_rms_mm'] * 1000
+    rms_mrad = r['noise_rms_rad'] * 1000
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Residual (µm)')
+    ax.set_title(f'System Noise  (measured − {n_harm}-harmonic model)\n'
+                 f'σ = {rms_um:.1f} µm  ({rms_mrad:.2f} mrad)')
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: noise PSD
+    ax = axes2[1]
+    f_n = r['f_noise']
+    psd_n = r['psd_noise']
+    psd_s = r['psd_signal']
+    ax.semilogy(f_n, psd_s, color='steelblue', lw=0.6, alpha=0.7,
+                label='Signal (HP-filtered)')
+    ax.semilogy(f_n, psd_n, color='red', lw=0.8,
+                label='Noise (residual)')
+    for h, fc, _ in r.get('harmonic_info', []):
+        ax.axvline(fc, color='steelblue', ls=':', lw=0.5, alpha=0.4)
+    nfd = r['noise_floor_density']
+    ax.axhline(nfd, color='red', ls='--', lw=1, alpha=0.6,
+               label=f'Noise floor: {10*np.log10(nfd+1e-20):.1f} dB(mm²/Hz)')
+    ax.set_xlabel('Frequency (Hz)')
+    ax.set_ylabel('PSD (mm²/Hz)')
+    ax.set_xlim(0, min(r['fs'] / 2, f0 * (n_harm + 3 if n_harm else 5)))
+    ax.set_title('Power Spectral Density: Signal vs Noise Residual')
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+    return fig1, fig2
+
 
 def main():
     if len(sys.argv) < 2:
@@ -342,11 +508,18 @@ def main():
 
     title = (f'61 GHz Radar — Pendulum  |  {os.path.basename(csv_path)}'
              f'  |  {results["T_total"]/60:.1f} min  |  Q = {results["Q_val"]:.0f}')
-    fig = plot_results(results, title=title)
+    fig_main, fig_noise = plot_results(results, title=title)
 
     if out_path:
-        fig.savefig(out_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {out_path}")
+        base, ext = os.path.splitext(out_path)
+        if ext == "":
+            ext = ".png"
+        out_main  = base + "_main" + ext
+        out_noise = base + "_noise" + ext
+        fig_main.savefig(out_main, dpi=200, bbox_inches='tight')
+        fig_noise.savefig(out_noise, dpi=200, bbox_inches='tight')
+        print(f"Saved: {out_main}")
+        print(f"Saved: {out_noise}")
     else:
         plt.show()
 
