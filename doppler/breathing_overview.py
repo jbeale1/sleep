@@ -224,69 +224,133 @@ def compute_breath_envelope(disp_mm, fs, breath_lo, breath_hi, smooth_s=5.0):
     return t_env, env_mm
 
 
-def compute_periodic_breathing(t_env, env_mm, fs,
-                                pb_lo_period=20, pb_hi_period=120,
-                                pb_win_s=300, pb_step_s=30):
-    """Compute spectrogram of the breathing amplitude envelope to reveal
-    periodic breathing (Cheyne-Stokes type amplitude modulation).
+def detect_periodic_breathing(t_env, env_mm, fs,
+                               pb_lo_period=15, pb_hi_period=90,
+                               pb_win_s=180, pb_step_s=10,
+                               pb_thresh=0.3, pb_min_dur_s=120,
+                               amp_clamp_mm=15.0):
+    """Detect periodic breathing episodes via autocorrelation of the
+    breathing amplitude envelope.
 
     Args:
-        pb_lo_period, pb_hi_period: period range in seconds to display
-        pb_win_s: PSD window length (needs to be several cycles)
+        pb_lo_period, pb_hi_period: cycle period search range (seconds)
+        pb_win_s: autocorrelation window (should span ~3+ cycles)
         pb_step_s: step between windows
+        pb_thresh: minimum autocorrelation peak to consider periodic
+        pb_min_dur_s: minimum contiguous duration to count as PB episode
+        amp_clamp_mm: clamp envelope before analysis (reject body movements)
 
     Returns:
         t_pb: window centre times (s)
-        f_pb: frequency axis (Hz, of the modulation)
-        pb_spec: modulation spectrogram (power)
-        dom_period: dominant modulation period per window (s), NaN if none
+        periodicity: autocorrelation peak height per window (0–1)
+        cycle_period: detected cycle period per window (s), NaN if none
+        pb_episodes: list of (start_s, end_s, duration_s, mean_period_s)
     """
-    # Downsample envelope to ~2 Hz (plenty for 20-120s periods)
+    # Downsample envelope to ~2 Hz
     ds_factor = max(1, int(fs / 2))
     env_ds = env_mm[::ds_factor]
     fs_ds = fs / ds_factor
     t_ds = np.arange(len(env_ds)) / fs_ds
 
-    # Remove slow trend from envelope
-    trend_win = max(int(pb_hi_period * 2 * fs_ds), 3)
+    # Clamp to reject gross body movements
+    env_ds = np.minimum(env_ds, amp_clamp_mm)
+
+    # Remove slow trend
+    trend_win = max(int(pb_hi_period * 3 * fs_ds), 3)
     if trend_win % 2 == 0:
         trend_win += 1
     env_detrend = env_ds - uniform_filter1d(env_ds, trend_win)
 
     win_n = int(pb_win_s * fs_ds)
     step_n = int(pb_step_s * fs_ds)
-    nperseg = min(win_n, int(pb_hi_period * 2 * fs_ds))
+
+    min_lag = int(pb_lo_period * fs_ds)
+    max_lag = int(pb_hi_period * fs_ds)
 
     t_pb = []
-    spec_list = []
-    dom_period = []
-
-    f_lo = 1.0 / pb_hi_period
-    f_hi = 1.0 / pb_lo_period
+    periodicity = []
+    cycle_period = []
 
     for start in range(0, len(env_detrend) - win_n, step_n):
+        seg = env_detrend[start:start + win_n]
         tc = t_ds[start + win_n // 2]
         t_pb.append(tc)
 
-        seg = env_detrend[start:start + win_n]
-        f_w, psd_w = sig.welch(seg, fs=fs_ds, nperseg=nperseg,
-                               noverlap=nperseg // 2)
-        spec_list.append(psd_w)
-
-        # Find dominant modulation period
-        mask = (f_w >= f_lo) & (f_w <= f_hi)
-        if mask.any() and psd_w[mask].max() > 0:
-            pk_f = f_w[mask][np.argmax(psd_w[mask])]
-            dom_period.append(1.0 / pk_f if pk_f > 0 else np.nan)
+        # Autocorrelation (normalized)
+        seg_z = seg - np.mean(seg)
+        ac = np.correlate(seg_z, seg_z, mode='full')
+        ac = ac[len(ac) // 2:]
+        if ac[0] > 0:
+            ac = ac / ac[0]
         else:
-            dom_period.append(np.nan)
+            periodicity.append(0.0)
+            cycle_period.append(np.nan)
+            continue
+
+        # Search for peaks in the PB period range
+        search = ac[min_lag:min(max_lag + 1, len(ac))]
+        if len(search) < 3:
+            periodicity.append(0.0)
+            cycle_period.append(np.nan)
+            continue
+
+        pks, props = sig.find_peaks(search, prominence=0.05)
+        if len(pks) > 0:
+            best = pks[np.argmax(props['prominences'])]
+            pk_val = search[best]
+            lag = min_lag + best
+            periodicity.append(max(0, pk_val))
+            cycle_period.append(lag / fs_ds)
+        else:
+            periodicity.append(0.0)
+            cycle_period.append(np.nan)
 
     t_pb = np.array(t_pb)
-    dom_period = np.array(dom_period)
-    pb_spec = np.array(spec_list).T
-    f_pb = f_w
+    periodicity = np.array(periodicity)
+    cycle_period = np.array(cycle_period)
 
-    return t_pb, f_pb, pb_spec, dom_period
+    # Find contiguous PB episodes
+    is_pb = periodicity >= pb_thresh
+    raw_episodes = []
+    in_ep = False
+    ep_start = 0
+    for i in range(len(is_pb)):
+        if is_pb[i] and not in_ep:
+            in_ep = True
+            ep_start = i
+        elif not is_pb[i] and in_ep:
+            in_ep = False
+            dur = t_pb[i - 1] - t_pb[ep_start]
+            mean_per = np.nanmedian(cycle_period[ep_start:i])
+            raw_episodes.append((t_pb[ep_start], t_pb[i - 1], dur, mean_per))
+    if in_ep:
+        dur = t_pb[-1] - t_pb[ep_start]
+        mean_per = np.nanmedian(cycle_period[ep_start:])
+        raw_episodes.append((t_pb[ep_start], t_pb[-1], dur, mean_per))
+
+    # Bridge gaps shorter than 2.5× cycle period
+    pb_episodes = []
+    for ep in raw_episodes:
+        if pb_episodes:
+            prev_start, prev_end, prev_dur, prev_per = pb_episodes[-1]
+            gap = ep[0] - prev_end
+            bridge_limit = 2.5 * max(np.nanmedian([prev_per, ep[3]]),
+                                    pb_lo_period) if not (np.isnan(prev_per) and np.isnan(ep[3])) \
+                           else pb_hi_period
+            if gap <= bridge_limit:
+                # Merge with previous
+                merged_dur = ep[1] - prev_start
+                # Recompute median period over merged span
+                mask = (t_pb >= prev_start) & (t_pb <= ep[1])
+                merged_per = np.nanmedian(cycle_period[mask])
+                pb_episodes[-1] = (prev_start, ep[1], merged_dur, merged_per)
+                continue
+        pb_episodes.append(ep)
+
+    # Filter by minimum duration
+    pb_episodes = [(s, e, d, p) for s, e, d, p in pb_episodes if d >= pb_min_dur_s]
+
+    return t_pb, periodicity, cycle_period, pb_episodes
 
 
 def detect_apneas(t_env, env_mm, apnea_thresh, apnea_min_s,
@@ -347,10 +411,10 @@ def make_time_axis(t_seconds, start_time):
 def plot_overview(t_centres, br_rates, f_spec, br_spec,
                   t_env, env_mm, baseline,
                   apnea_events,
-                  t_pb, f_pb, pb_spec, dom_period,
+                  t_pb, periodicity, cycle_period, pb_episodes,
                   I_raw, Q_raw, fs,
                   start_time=None, breath_lo=0.10, breath_hi=0.50,
-                  apnea_thresh=0.25):
+                  apnea_thresh=0.25, amp_clamp_pkpk=30.0, pb_thresh=0.3):
     """Create 5-panel breathing overview figure."""
 
     use_dt = start_time is not None
@@ -361,6 +425,8 @@ def plot_overview(t_centres, br_rates, f_spec, br_spec,
     n_apneas = len(apnea_events)
     total_apnea_s = sum(d for _, _, d in apnea_events)
     ahi_est = n_apneas / total_h if total_h > 0 else 0
+    n_pb = len(pb_episodes)
+    total_pb_min = sum(d for _, _, d, _ in pb_episodes) / 60
 
     fig, axes = plt.subplots(5, 1, figsize=(16, 18), layout='constrained',
                              sharex=True)
@@ -414,12 +480,11 @@ def plot_overview(t_centres, br_rates, f_spec, br_spec,
 
     # ── Panel 3: High-res breathing amplitude + apnea markers ─────────────────
     ax = axes[2]
-    # Downsample envelope for plotting (1 Hz is plenty for display)
     ds_plot = max(1, int(fs / 2))
     t_env_ds = t_env[::ds_plot]
     env_ds = env_mm[::ds_plot]
     baseline_ds = baseline[::ds_plot]
-    amp_pkpk = env_ds * 2     # half-amplitude → pk-pk
+    amp_pkpk = np.minimum(env_ds * 2, amp_clamp_pkpk)  # clamp
     baseline_pkpk = baseline_ds * 2
     thresh_line = baseline_pkpk * apnea_thresh
 
@@ -449,53 +514,60 @@ def plot_overview(t_centres, br_rates, f_spec, br_spec,
             xe = ev_end / 3600
         ax.axvspan(xs, xe, alpha=0.2, color='red')
 
+    # Also shade PB episodes on amplitude panel
+    for ev_start, ev_end, dur, per in pb_episodes:
+        if use_dt:
+            xs = start_time + timedelta(seconds=float(ev_start))
+            xe = start_time + timedelta(seconds=float(ev_end))
+        else:
+            xs = ev_start / 3600
+            xe = ev_end / 3600
+        ax.axvspan(xs, xe, alpha=0.12, color='orange')
+
     ax.set_ylabel('Amplitude (mm pk-pk)')
-    ax.set_title(f'Breathing Amplitude (Hilbert envelope, 5s smooth)  |  '
-                 f'{n_apneas} events ≥10s  ({total_apnea_s:.0f}s total)  |  '
-                 f'~{ahi_est:.0f}/h')
+    ax.set_title(f'Breathing Amplitude (Hilbert envelope, clamped {amp_clamp_pkpk:.0f} mm)  |  '
+                 f'{n_apneas} apnea events  |  '
+                 f'{n_pb} PB episodes (orange)')
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, alpha=0.3)
-    ax.set_ylim(bottom=0)
+    ax.set_ylim(0, amp_clamp_pkpk * 1.05)
 
-    # ── Panel 4: Periodic breathing modulation spectrogram ────────────────────
+    # ── Panel 4: Periodicity index + PB episodes ─────────────────────────────
     ax = axes[3]
-    # Display as period (s) on y-axis instead of frequency
-    pb_lo_f = 1.0 / 120.0   # longest period to show
-    pb_hi_f = 1.0 / 20.0    # shortest period
-    f_mask_pb = (f_pb >= pb_lo_f) & (f_pb <= pb_hi_f)
-    f_pb_plot = f_pb[f_mask_pb]
-    period_plot = 1.0 / (f_pb_plot + 1e-12)  # frequency → period in seconds
-
-    pb_spec_plot = 10 * np.log10(pb_spec[f_mask_pb, :] + 1e-20)
-    vmin_pb, vmax_pb = np.percentile(pb_spec_plot, [10, 97])
-
     if use_dt:
         t_pb_ax = make_time_axis(t_pb, start_time)
-        im_pb = ax.pcolormesh(t_pb_ax, period_plot, pb_spec_plot,
-                              shading='gouraud', cmap='inferno',
-                              vmin=vmin_pb, vmax=vmax_pb)
+        ax.plot(t_pb_ax, periodicity, color='steelblue', lw=0.8)
     else:
         t_pb_hrs = t_pb / 3600
-        im_pb = ax.pcolormesh(t_pb_hrs, period_plot, pb_spec_plot,
-                              shading='gouraud', cmap='inferno',
-                              vmin=vmin_pb, vmax=vmax_pb)
+        ax.plot(t_pb_hrs, periodicity, color='steelblue', lw=0.8)
 
-    # Overlay dominant period
-    valid_pb = ~np.isnan(dom_period) & (dom_period >= 20) & (dom_period <= 120)
-    if use_dt and valid_pb.any():
-        ax.plot(t_pb_ax[valid_pb], dom_period[valid_pb], 'c.', ms=3, alpha=0.7,
-                label='Dominant period')
-    elif valid_pb.any():
-        ax.plot(t_pb_hrs[valid_pb], dom_period[valid_pb], 'c.', ms=3, alpha=0.7,
-                label='Dominant period')
+    ax.axhline(pb_thresh, color='red', ls='--', lw=1, alpha=0.6,
+               label=f'PB threshold ({pb_thresh})')
 
-    ax.set_ylabel('Modulation period (s)')
-    ax.set_title('Periodic Breathing Detection  (amplitude modulation, 20–120 s)')
-    ax.set_ylim(20, 120)
-    ax.invert_yaxis()  # shorter periods at top
-    plt.colorbar(im_pb, ax=ax, label='dB', shrink=0.8, pad=0.01)
-    if valid_pb.any():
-        ax.legend(fontsize=8, loc='upper right')
+    # Shade PB episodes and annotate cycle period
+    for ev_start, ev_end, dur, per in pb_episodes:
+        if use_dt:
+            xs = start_time + timedelta(seconds=float(ev_start))
+            xe = start_time + timedelta(seconds=float(ev_end))
+            xm = start_time + timedelta(seconds=float((ev_start + ev_end) / 2))
+        else:
+            xs = ev_start / 3600
+            xe = ev_end / 3600
+            xm = (ev_start + ev_end) / 2 / 3600
+        ax.axvspan(xs, xe, alpha=0.15, color='orange')
+        if not np.isnan(per):
+            dur_min = dur / 60
+            ax.text(xm, pb_thresh + 0.05,
+                    f'{dur_min:.0f}m\nT={per:.0f}s',
+                    ha='center', va='bottom', fontsize=7, color='darkorange',
+                    fontweight='bold', linespacing=1.2)
+
+    ax.set_ylabel('Periodicity index')
+    ax.set_ylim(-0.05, 1.0)
+    ax.set_title(f'Periodic Breathing Detection  |  '
+                 f'{n_pb} episodes ≥2 min  ({total_pb_min:.0f} min total)'
+                 + (f'  |  ~{total_pb_min/total_h*60:.0f} min/h' if total_h > 0 else ''))
+    ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, alpha=0.3)
 
     # ── Panel 5: Compact micro-Doppler ────────────────────────────────────────
@@ -548,7 +620,8 @@ def plot_overview(t_centres, br_rates, f_spec, br_spec,
         date_str = f'{total_s:.0f}s'
     fig.suptitle(f'Breathing Overview — {date_str} — {total_h:.1f} hours\n'
                  f'Median rate: {med_rate:.1f}/min  |  '
-                 f'{n_apneas} amplitude drops ≥10s  |  ~{ahi_est:.0f}/h',
+                 f'{n_apneas} amplitude drops ≥10s  |  '
+                 f'{n_pb} PB episodes ({total_pb_min:.0f} min)',
                  fontsize=13, fontweight='bold')
 
     return fig
@@ -576,6 +649,18 @@ def main():
                         help='Minimum apnea duration (seconds)')
     parser.add_argument('--baseline-win', type=float, default=300,
                         help='Local amplitude baseline window (seconds)')
+    parser.add_argument('--amp-clamp', type=float, default=30.0,
+                        help='Clamp breathing amplitude display (mm pk-pk)')
+    parser.add_argument('--pb-thresh', type=float, default=0.3,
+                        help='Periodicity index threshold for PB detection')
+    parser.add_argument('--pb-min-dur', type=float, default=120,
+                        help='Minimum PB episode duration (seconds)')
+    parser.add_argument('--pb-lo-period', type=float, default=15,
+                        help='Shortest PB cycle period to detect (seconds)')
+    parser.add_argument('--pb-hi-period', type=float, default=90,
+                        help='Longest PB cycle period to detect (seconds)')
+    parser.add_argument('--env-smooth', type=float, default=10.0,
+                        help='Envelope smoothing window (seconds)')
     parser.add_argument('--output', default=None,
                         help='Save to file instead of displaying')
     parser.add_argument('--dpi', type=int, default=150,
@@ -603,17 +688,22 @@ def main():
     t_centres, br_rates, f_spec, br_spec = extract_breathing(
         disp_mm, fs, args.win, args.step, args.breath_lo, args.breath_hi)
 
-    print("Computing breathing envelope (Hilbert, 5s smooth)...")
+    print("Computing breathing envelope (Hilbert, {:.0f}s smooth)...".format(args.env_smooth))
     t_env, env_mm = compute_breath_envelope(
-        disp_mm, fs, args.breath_lo, args.breath_hi)
+        disp_mm, fs, args.breath_lo, args.breath_hi, smooth_s=args.env_smooth)
 
     print("Detecting amplitude drops...")
     apnea_events, baseline = detect_apneas(
         t_env, env_mm, args.apnea_thresh, args.apnea_min,
         args.baseline_win, fs)
 
-    print("Analysing periodic breathing modulation...")
-    t_pb, f_pb, pb_spec, dom_period = compute_periodic_breathing(t_env, env_mm, fs)
+    print("Detecting periodic breathing...")
+    t_pb, periodicity, cycle_period, pb_episodes = detect_periodic_breathing(
+        t_env, env_mm, fs, pb_thresh=args.pb_thresh,
+        pb_min_dur_s=args.pb_min_dur,
+        pb_lo_period=args.pb_lo_period,
+        pb_hi_period=args.pb_hi_period,
+        amp_clamp_mm=args.amp_clamp / 2)  # pk-pk → half-amplitude
 
     valid_rate = br_rates[~np.isnan(br_rates)]
     print(f"  Breathing rate: {np.median(valid_rate):.1f}/min median "
@@ -630,21 +720,27 @@ def main():
         print(f"    ... and {len(apnea_events) - 20} more")
 
     # Report periodic breathing
-    valid_pb = ~np.isnan(dom_period) & (dom_period >= 20) & (dom_period <= 120)
-    if valid_pb.any():
-        med_period = np.median(dom_period[valid_pb])
-        print(f"  Periodic breathing: median cycle {med_period:.0f}s "
-              f"(detected in {np.sum(valid_pb)}/{len(dom_period)} windows)")
+    print(f"  Periodic breathing episodes ≥{args.pb_min_dur:.0f}s: {len(pb_episodes)}")
+    for i, (es, ee, dur, per) in enumerate(pb_episodes):
+        if start_time:
+            ts = (start_time + timedelta(seconds=float(es))).strftime('%H:%M:%S')
+            te = (start_time + timedelta(seconds=float(ee))).strftime('%H:%M:%S')
+        else:
+            ts = f'{es:.0f}s'
+            te = f'{ee:.0f}s'
+        print(f"    #{i+1}: {ts}–{te}  ({dur/60:.1f} min, cycle {per:.0f}s)")
 
     print("Plotting...")
     fig = plot_overview(t_centres, br_rates, f_spec, br_spec,
                         t_env, env_mm, baseline,
                         apnea_events,
-                        t_pb, f_pb, pb_spec, dom_period,
+                        t_pb, periodicity, cycle_period, pb_episodes,
                         I, Q, fs,
                         start_time=start_time,
                         breath_lo=args.breath_lo, breath_hi=args.breath_hi,
-                        apnea_thresh=args.apnea_thresh)
+                        apnea_thresh=args.apnea_thresh,
+                        amp_clamp_pkpk=args.amp_clamp,
+                        pb_thresh=args.pb_thresh)
 
     if args.output:
         fig.savefig(args.output, dpi=args.dpi, bbox_inches='tight')
