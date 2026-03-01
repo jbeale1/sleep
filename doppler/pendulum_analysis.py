@@ -27,26 +27,46 @@ SEG_MAX_TAU_ERR  = 0.15      # reject windows where τ_err/τ exceeds this fract
 
 def load_iq(path):
     import csv
-    elapsed_ms, I_raw, Q_raw = [], [], []
+    seqs, I_raw, Q_raw = [], [], []
+    ms_raw = []
     with open(path, newline='') as f:
         reader = csv.reader(f)
         next(reader)                        # skip header
         for row in reader:
-            if len(row) < 3:
+            if len(row) < 4:
                 continue
             try:
-                elapsed_ms.append(float(row[0]))
-                I_raw.append(float(row[1]))
-                Q_raw.append(float(row[2]))
+                seqs.append(int(row[0]))
+                ms_raw.append(int(row[1]))
+                I_raw.append(int(row[2]))
+                Q_raw.append(int(row[3]))
             except ValueError:
                 continue
-    elapsed_ms = np.asarray(elapsed_ms)
-    I_raw      = np.asarray(I_raw)
-    Q_raw      = np.asarray(Q_raw)
-    n          = len(elapsed_ms)
-    T_total    = elapsed_ms[-1] / 1000.0
-    fs         = (n - 1) / T_total
-    t          = np.arange(n) / fs
+    seqs   = np.asarray(seqs)
+    ms_raw = np.asarray(ms_raw)
+    I_raw  = np.asarray(I_raw, dtype=np.float64)
+    Q_raw  = np.asarray(Q_raw, dtype=np.float64)
+    n      = len(seqs)
+
+    # Check for dropped samples via sequence gaps
+    seq_diffs = np.diff(seqs)
+    gaps = np.where(seq_diffs != 1)[0]
+    if len(gaps):
+        total_dropped = int(np.sum(seq_diffs[gaps] - 1))
+        print(f"  WARNING: {total_dropped} dropped samples at {len(gaps)} gap(s)")
+
+    # Reconstruct elapsed time from ms%1000 with rollover tracking
+    elapsed_ms = np.zeros(n, dtype=np.float64)
+    epoch = 0
+    for i in range(1, n):
+        if ms_raw[i] < ms_raw[i-1] - 500:
+            epoch += 1000
+        elapsed_ms[i] = epoch + ms_raw[i] - ms_raw[0]
+
+    T_total = elapsed_ms[-1] / 1000.0
+    fs      = (n - 1) / T_total
+    t       = np.arange(n) / fs
+    print(f"  {n} samples, {T_total:.1f} s, fs = {fs:.1f} Hz")
     return t, I_raw, Q_raw, fs, T_total
 
 def iq_to_displacement_mm(I_raw, Q_raw):

@@ -15,41 +15,35 @@ lib_deps =
 
 */
 
-
 ADS1256 ads(18, 20, 21, 19, 2.5);
 
-const int CS_PIN  = 19;
+const int CS_PIN   = 19;
 const int DRDY_PIN = 18;
-const int NUM_AVG = 5;
+const int NUM_AVG  = 5;
+
+uint32_t seq = 0;
 
 inline void waitDRDY() { while (digitalRead(DRDY_PIN) == HIGH) {} }
 
-// Write MUX register without any delays (CS must already be LOW)
 inline void fastSetMUX(uint8_t mux) {
-    SPI.transfer(0x51); // WREG MUX_REG (0x50 | 0x01)
+    SPI.transfer(0x51);
     SPI.transfer(0x00);
     SPI.transfer(mux);
 }
 
 long readPipelined(uint8_t nextMux) {
-    // On entry: a conversion is already running
     waitDRDY();
-    fastSetMUX(nextMux);           // switch to next channel
+    fastSetMUX(nextMux);
     SPI.transfer(0b11111100);      // SYNC
     delayMicroseconds(4);
-    SPI.transfer(0b11111111);      // WAKEUP  (starts conversion on nextMux)
-    SPI.transfer(0b00000001);      // RDATA   (reads result from PREVIOUS channel)
+    SPI.transfer(0b11111111);      // WAKEUP
+    SPI.transfer(0b00000001);      // RDATA
     delayMicroseconds(7);
     uint8_t b0 = SPI.transfer(0);
     uint8_t b1 = SPI.transfer(0);
     uint8_t b2 = SPI.transfer(0);
     long val = ((long)b0 << 16) | ((long)b1 << 8) | b2;
     return (val & (1l << 23)) ? val - 0x1000000 : val;
-}
-
-float toVolts(long raw) {
-    // PGA=1, Vref=2.5V: full scale = ±2.5V = ±8388608 counts
-    return raw * (2.0f * 2.5f / 8388608.0f);
 }
 
 void setup() {
@@ -60,31 +54,29 @@ void setup() {
     ads.setDRATE(DRATE_2000SPS);
     ads.setPGA(PGA_1);
 
-    Serial.println("ch0_V,ch1_V");
+    Serial.println("seq,ms,I,Q");
 
-    // Start the pipeline: set MUX to ch0, begin first conversion
     SPI.beginTransaction(SPISettings(1920000, MSBFIRST, SPI_MODE1));
     digitalWrite(CS_PIN, LOW);
     fastSetMUX(SING_0);
-    SPI.transfer(0b11111100); // SYNC
+    SPI.transfer(0b11111100);      // SYNC
     delayMicroseconds(4);
-    SPI.transfer(0b11111111); // WAKEUP
-    // CS stays LOW — we keep the pipeline running
+    SPI.transfer(0b11111111);      // WAKEUP
 }
 
 void loop() {
-    float sumCh0 = 0, sumCh1 = 0;
+    long sumCh0 = 0, sumCh1 = 0;
 
     for (int i = 0; i < NUM_AVG; i++) {
-        // Read ch0 result, set up ch1 conversion
-        long ch0 = readPipelined(SING_1);
-        // Read ch1 result, set up ch0 conversion
-        long ch1 = readPipelined(SING_0);
-        sumCh0 += toVolts(ch0);
-        sumCh1 += toVolts(ch1);
+        sumCh0 += readPipelined(SING_1);
+        sumCh1 += readPipelined(SING_0);
     }
 
-    Serial.print(sumCh0 / NUM_AVG, 6);
-    Serial.print(",");
-    Serial.println(sumCh1 / NUM_AVG, 6);
+    Serial.print(seq++);
+    Serial.print(',');
+    Serial.print(millis() % 1000);
+    Serial.print(',');
+    Serial.print(sumCh0 / NUM_AVG);
+    Serial.print(',');
+    Serial.println(sumCh1 / NUM_AVG);
 }
