@@ -90,6 +90,14 @@ def find_input_files(input_dir):
         files['ecg_beats'] = ecg_matches[-1]
         if len(ecg_matches) > 1:
             print(f"  Note: found {len(ecg_matches)} ECG beats files, using {os.path.basename(ecg_matches[-1])}")
+    else:
+        # Fallback: Polar H10 RR-interval file (e.g. Polar_H10_07C91131_20260226_231102_RR.txt)
+        polar_pattern = os.path.join(input_dir, "Polar_H10_*_RR.txt")
+        polar_matches = sorted(glob.glob(polar_pattern))
+        if polar_matches:
+            files['polar_rr'] = polar_matches[-1]
+            if len(polar_matches) > 1:
+                print(f"  Note: found {len(polar_matches)} Polar RR files, using {os.path.basename(polar_matches[-1])}")
 
     # Optional: periodic breathing report (produced by detect_periodic_breathing.py)
     pb_path = os.path.join(input_dir, "periodic_breathing_report.csv")
@@ -402,6 +410,80 @@ def read_ecg_beats(filepath, ref_date, bin_seconds=2, pleth_delay_s=0.25):
         if vals:
             epoch_bin = t_start + 1.0 + j
             t_min = (epoch_bin - local_midnight_epoch) / 60.0
+            result.append([round(t_min, 4), round(sum(vals) / len(vals), 1)])
+
+    return result
+
+
+def read_polar_rr(filepath, ref_date, bin_seconds=2):
+    """Read Polar H10 RR-interval file and compute causal median-3 smoothed HR.
+    Format: semicolon-delimited, 'Phone timestamp' in local US-Pacific time
+    (ISO 8601 with milliseconds), 'RR-interval [ms]' column.
+    Returns list of [t_minutes, hr_bpm] pairs (same format as read_ecg_beats), or [] on error."""
+    ref_midnight = datetime.combine(ref_date, datetime.min.time())
+
+    beats = []  # (seconds_since_midnight, rr_ms)
+    try:
+        with open(filepath, newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f, delimiter=';')
+            for row in reader:
+                try:
+                    ts = row['Phone timestamp'].strip()
+                    rr_ms = float(row['RR-interval [ms]'].strip())
+                except (ValueError, KeyError):
+                    continue
+                if not (100 < rr_ms < 3000):
+                    continue
+                try:
+                    dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%f")
+                except ValueError:
+                    try:
+                        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S")
+                    except ValueError:
+                        continue
+                t_sec = (dt - ref_midnight).total_seconds()
+                beats.append((t_sec, rr_ms))
+    except OSError:
+        return []
+
+    if len(beats) < 4:
+        return []
+
+    beat_times = [b[0] for b in beats]  # seconds since midnight of ref_date
+
+    # Step 1: 1-Hz grid of last-cycle instantaneous HR
+    t_start = beat_times[0]
+    t_end   = beat_times[-1]
+    grid_1hz = []
+    t = t_start + 1.0
+    while t <= t_end:
+        idx = bisect.bisect_right(beat_times, t) - 1
+        if idx >= 1:
+            iv = (beat_times[idx] - beat_times[idx - 1]) * 1000.0  # ms
+            grid_1hz.append(60000.0 / iv if 300 < iv < 3000 else None)
+        else:
+            grid_1hz.append(None)
+        t += 1.0
+
+    if not grid_1hz:
+        return []
+
+    # Step 2: causal median-3 spike filter
+    med3 = list(grid_1hz)
+    for i in range(2, len(med3)):
+        window = [v for v in [grid_1hz[i - 2], grid_1hz[i - 1], grid_1hz[i]] if v is not None]
+        if len(window) >= 2:
+            med3[i] = sorted(window)[len(window) // 2]
+
+    # Step 3: resample to bin_seconds by averaging
+    result = []
+    n = len(med3)
+    for j in range(0, n, bin_seconds):
+        chunk = med3[j:j + bin_seconds]
+        vals = [v for v in chunk if v is not None]
+        if vals:
+            t_sec_bin = t_start + 1.0 + j
+            t_min = t_sec_bin / 60.0
             result.append([round(t_min, 4), round(sum(vals) / len(vals), 1)])
 
     return result
@@ -2064,6 +2146,9 @@ def main():
     if 'ecg_beats' in files:
         ecg_hr = read_ecg_beats(files['ecg_beats'], ref_date)
         print(f"  ECG beats HR samples: {len(ecg_hr)}")
+    elif 'polar_rr' in files:
+        ecg_hr = read_polar_rr(files['polar_rr'], ref_date)
+        print(f"  Polar H10 RR HR samples: {len(ecg_hr)}")
 
     # -> New: compute apnea counts for dashboard (seconds)
     apnea_count_gt10 = sum(1 for a in apnea if a[1] > 10.0)

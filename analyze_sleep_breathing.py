@@ -39,6 +39,7 @@ MIN_BREATH_DURATION = 0.3
 # No-breathing (apnea) detection
 APNEA_RMS_THRESHOLD = 0.002  # Below this = no breathing
 MIN_APNEA_DURATION = 10.0    # Minimum gap duration to report (seconds)
+MAX_APNEA_DURATION = 120.0   # Maximum plausible gap; longer events indicate mic failure
 
 # Obstruction severity thresholds (absolute, calibrated from sample data)
 # Based on peak RMS amplitude and spectral low-frequency ratio
@@ -584,6 +585,9 @@ def detect_apnea_gaps(audio, sr, breath_cycles):
             # Quiet breathing detected despite low broadband RMS
             continue
         
+        if gap['duration'] > MAX_APNEA_DURATION:
+            continue  # Gap too long — likely microphone failure, discard
+
         true_apnea_gaps.append({
             'start': gap['start'],
             'end': gap['end'],

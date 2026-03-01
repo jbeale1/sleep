@@ -2,7 +2,7 @@
 setlocal
 
 set PYTHON=C:\Users\beale\AppData\Local\Programs\Python\Python312\python.exe
-set DIR=C:\Users\beale\Documents\2026-sleep\20260221
+set DIR=C:\Users\beale\Documents\2026-sleep\20260301
 set SCRIPTS=C:\Users\beale\Documents\2026-sleep\sleep
 
 echo ============================================

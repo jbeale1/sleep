@@ -429,7 +429,6 @@ try:
         # --- Single-sample spike rejection (1-sample lookahead delay) ---
         # Process _spike_p (s[n-1]) now that we have its right neighbour (s[n]).
         # Check it against the midpoint of s[n-2] and s[n]; replace if it's a spike.
-        global _spike_pp, _spike_p
         candidate   = _spike_p      # s[n-1]: the sample about to be used
         prev2       = _spike_pp     # s[n-2]: left neighbour for spike test
         _spike_pp   = _spike_p      # advance state
