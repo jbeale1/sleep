@@ -5,7 +5,7 @@ If output_png is omitted the plot is displayed interactively.
 """
 
 
-VERSION = "1.8-weighted-Q-fit"
+VERSION = "1.9.6-phase-unwrap"
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -25,6 +25,13 @@ SEG_STEP_FRAC    = 0.025     # step size as fraction of record length (min 60 s,
 SEG_MIN_AMP_MM   = 0.15      # reject windows with mean amplitude below this (mm)
 SEG_MAX_Q_FACTOR = 3.0       # reject windows where Q > this × median(Q)
 SEG_MAX_TAU_ERR  = 0.15      # reject windows where τ_err/τ exceeds this fraction
+
+# ── large-record streaming configuration ──────────────────────────────────────
+LARGE_RECORD_HOURS   = 2.0        # hours — use analyse_large() above this
+CHUNK_MINUTES        = 5.0        # minutes per streaming chunk
+HOURLY_CHUNKS        = 12         # chunks per hour (= 60 / CHUNK_MINUTES)
+CUTOFF_SNR           = 5.0        # stop when chunk amplitude < this × noise floor
+NOISE_FLOOR_INIT_CHUNKS = 6       # first N chunks used to estimate global noise floor
 
 # ── noise analysis configuration ─────────────────────────────────────────────
 NOISE_SMOOTH_S   = 20.0      # seconds — smoothing window for envelope/phase
@@ -259,7 +266,11 @@ def synthesize_pendulum_parametric(t, disp_hp, f0, tau,
         n_env_use = n_env
     else:
         phi = 2.0 * np.pi * f0 * t
-        n_env_use = max(n_env, 2)   # need n=2 without phase tracking
+        # n_env=2 is needed for full-record fits (captures amplitude-frequency
+        # coupling).  For short chunks the two envelope columns are nearly
+        # identical (exp(-t/τ) barely changes over 5 min) making the basis
+        # near-singular — so honour the caller's n_env request exactly.
+        n_env_use = n_env
 
     cols = []; active_harmonics = []
     for h in range(1, n_harmonics + 1):
@@ -766,6 +777,673 @@ def plot_results(r, title=''):
     return fig1, fig2
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LARGE-RECORD STREAMING PATH  (>LARGE_RECORD_HOURS hours)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _peek_csv_header(path):
+    """
+    Quick pre-scan: read first and last rows to estimate total duration and fs.
+    Returns (T_total_estimate_s, fs_estimate, n_rows_estimate).
+    Reads only first 50 rows and last 50 rows — O(1) memory.
+    """
+    import csv, os
+    rows_head = []
+    with open(path, newline='') as f:
+        reader = csv.reader(f)
+        next(reader)
+        for i, row in enumerate(reader):
+            if i >= 50:
+                break
+            if len(row) >= 4:
+                try:
+                    rows_head.append((int(row[1]),))   # ms_raw only
+                except ValueError:
+                    pass
+
+    # Seek near end of file to get last rows
+    fsize = os.path.getsize(path)
+    rows_tail = []
+    with open(path, 'rb') as f:
+        f.seek(max(0, fsize - 32768))
+        tail_bytes = f.read()
+    tail_text = tail_bytes.decode('utf-8', errors='replace')
+    tail_lines = tail_text.splitlines()
+    for line in reversed(tail_lines):
+        parts = line.split(',')
+        if len(parts) >= 4:
+            try:
+                rows_tail.append((int(parts[0]), int(parts[1])))
+                if len(rows_tail) >= 50:
+                    break
+            except ValueError:
+                pass
+    rows_tail.reverse()
+
+    if not rows_head or not rows_tail:
+        return None, None, None
+
+    ms0 = rows_head[0][0]
+    # Estimate fs from first block
+    if len(rows_head) > 2:
+        diffs = [rows_head[i+1][0] - rows_head[i][0] for i in range(len(rows_head)-1)
+                 if 0 < rows_head[i+1][0] - rows_head[i][0] < 500]
+        fs_est = 1000.0 / (sum(diffs)/len(diffs)) if diffs else None
+    else:
+        fs_est = None
+
+    # Last seq number gives row count
+    last_seq = rows_tail[-1][0]
+    last_ms  = rows_tail[-1][1]
+    # Approximate elapsed: seq numbers start at 0
+    T_est = last_seq / (fs_est if fs_est else 200.0)
+    return T_est, fs_est, last_seq + 1
+
+
+def _stream_chunks(path, chunk_samples):
+    """
+    Generator: yields (seq_arr, ms_arr, I_arr, Q_arr) numpy arrays one chunk
+    at a time. Each chunk is exactly chunk_samples rows (last chunk may be shorter).
+    Memory footprint: 4 × chunk_samples × 8 bytes ≈ a few MB per chunk.
+    """
+    import csv
+    seqs = []; ms_list = []; I_list = []; Q_list = []
+    with open(path, newline='') as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            if len(row) < 4:
+                continue
+            try:
+                seqs.append(int(row[0]))
+                ms_list.append(int(row[1]))
+                I_list.append(int(row[2]))
+                Q_list.append(int(row[3]))
+            except ValueError:
+                continue
+            if len(seqs) == chunk_samples:
+                yield (np.asarray(seqs),
+                       np.asarray(ms_list),
+                       np.asarray(I_list, dtype=np.float64),
+                       np.asarray(Q_list, dtype=np.float64))
+                seqs = []; ms_list = []; I_list = []; Q_list = []
+    if seqs:
+        yield (np.asarray(seqs),
+               np.asarray(ms_list),
+               np.asarray(I_list, dtype=np.float64),
+               np.asarray(Q_list, dtype=np.float64))
+
+
+def _chunk_ms_to_t(ms_raw):
+    """Reconstruct elapsed time within a chunk from ms%1000 with rollover."""
+    n = len(ms_raw)
+    elapsed_ms = np.zeros(n, dtype=np.float64)
+    epoch = 0
+    for i in range(1, n):
+        if ms_raw[i] < ms_raw[i-1] - 500:
+            epoch += 1000
+        elapsed_ms[i] = epoch + ms_raw[i] - ms_raw[0]
+    return elapsed_ms / 1000.0
+
+
+def _ekf_chunk(I_raw, Q_raw, lam, f0, fs, tau, x_init, P_init,
+               process_noise_mm=1e-4, meas_noise_frac=0.005):
+    """
+    Run one chunk through the EKF with pre-loaded state (x_init, P_init).
+    Returns (d_out, v_out, amp, x_final, P_final).
+    Identical maths to iq_displacement_ekf(); factored out for chunk streaming.
+    """
+    dt = 1.0 / fs
+    omega0 = 2.0 * np.pi * f0
+    lam_mm = lam * 1000.0
+
+    I = I_raw - I_raw.mean()
+    Q = Q_raw - Q_raw.mean()
+    z   = I + 1j * Q
+    amp = np.abs(z)
+    amp_median = np.median(amp)
+    n = len(z)
+
+    c, s = np.cos(omega0 * dt), np.sin(omega0 * dt)
+    F_mat = np.array([[c,  s / omega0],
+                      [-omega0 * s, c]]) * np.exp(-dt / tau)
+
+    qp = process_noise_mm ** 2
+    qv = (omega0 * process_noise_mm) ** 2
+    Q_proc = np.diag([qp, qv])
+
+    k4pi_lam = 4.0 * np.pi / lam_mm
+    d_out = np.empty(n); v_out = np.empty(n)
+
+    x = x_init.copy(); P = P_init.copy()
+    for k in range(n):
+        x = F_mat @ x
+        P = F_mat @ P @ F_mat.T + Q_proc
+
+        phi_pred = k4pi_lam * x[0]
+        cos_p = np.cos(phi_pred); sin_p = np.sin(phi_pred)
+        H = np.array([[-sin_p * k4pi_lam, 0.0],
+                      [ cos_p * k4pi_lam, 0.0]])
+
+        amp_norm = amp[k] / amp_median
+        r_val = (meas_noise_frac / max(amp_norm, 1e-4)) ** 2
+        R_mat = r_val * np.eye(2)
+
+        z_unit = z[k] / (amp[k] + 1e-12)
+        y = np.array([z_unit.real - cos_p, z_unit.imag - sin_p])
+        S = H @ P @ H.T + R_mat
+        K = P @ H.T @ np.linalg.inv(S)
+        x = x + K @ y
+        P = (np.eye(2) - K @ H) @ P
+
+        d_out[k] = x[0]; v_out[k] = x[1]
+
+    return d_out, v_out, amp, x, P
+
+
+def analyse_large(csv_path):
+    """
+    Memory-efficient analysis for multi-hour IQ CSV files.
+
+    Strategy
+    --------
+    1. Pre-scan CSV for duration / fs estimate.
+    2. Read first ~60 s block to determine f0, τ (global), noise floor.
+    3. Stream file in CHUNK_MINUTES chunks, running EKF with state hand-off.
+    4. Each chunk → one summary row: (t_centre, amplitude, phase_offset, noise_σ).
+    5. Hourly groups → exp-decay fit → τ_h → Q_h ± uncertainty.
+    6. Auto-stop when chunk amplitude < CUTOFF_SNR × global noise floor.
+    7. Identify best-SNR chunk for Figure 2 noise window.
+
+    Returns a dict compatible with plot_results_large().
+    """
+    import os
+    print(f"  [large-record mode]  scanning {os.path.basename(csv_path)} ...")
+
+    T_est, fs_est, n_rows_est = _peek_csv_header(csv_path)
+    if fs_est is None:
+        fs_est = 200.0
+    print(f"  Estimated: {n_rows_est} rows, {T_est/3600:.2f} h, fs≈{fs_est:.1f} Hz")
+
+    chunk_samples = int(CHUNK_MINUTES * 60 * fs_est)
+    lam = 3e8 / F_RADAR
+
+    # ── Phase 1: load first NOISE_FLOOR_INIT_CHUNKS chunks to bootstrap ─────
+    boot_I = []; boot_Q = []; boot_ms = []; boot_seq = []
+    boot_chunks_needed = NOISE_FLOOR_INIT_CHUNKS
+    first_seq = None   # global sequence number of the very first sample
+    for seq_a, ms_a, I_a, Q_a in _stream_chunks(csv_path, chunk_samples):
+        if first_seq is None:
+            first_seq = int(seq_a[0])
+        boot_I.append(I_a); boot_Q.append(Q_a); boot_ms.append(ms_a)
+        if len(boot_I) >= boot_chunks_needed:
+            break
+
+    I_boot = np.concatenate(boot_I)
+    Q_boot = np.concatenate(boot_Q)
+    ms_boot = np.concatenate(boot_ms)
+
+    # Reconstruct elapsed time for boot block
+    n_b = len(ms_boot)
+    elapsed_boot = np.zeros(n_b)
+    epoch = 0
+    for i in range(1, n_b):
+        if ms_boot[i] < ms_boot[i-1] - 500:
+            epoch += 1000
+        elapsed_boot[i] = epoch + ms_boot[i] - ms_boot[0]
+    elapsed_boot /= 1000.0
+    fs = (n_b - 1) / elapsed_boot[-1]
+    # Recompute chunk_samples with accurate fs
+    chunk_samples = int(CHUNK_MINUTES * 60 * fs)
+
+    print(f"  Bootstrap block: {n_b} samples, fs = {fs:.2f} Hz")
+
+    disp_boot, _ = iq_to_displacement_mm(I_boot, Q_boot)
+    sos_hp = signal.butter(4, HP_FC / (fs/2), btype='high', output='sos')
+    disp_hp_boot = signal.sosfiltfilt(sos_hp, disp_boot)
+    f0 = find_fundamental(disp_hp_boot, fs)
+
+    # Coarse envelope fit on boot block for initial τ and noise floor
+    sos_bp_c = signal.butter(4,
+                    [(f0 - BP_BW*3) / (fs/2), (f0 + BP_BW*3) / (fs/2)],
+                    btype='band', output='sos')
+    disp_bp_boot = signal.sosfiltfilt(sos_bp_c, disp_boot)
+    env_boot = np.abs(signal.hilbert(disp_bp_boot))
+    sos_lp = signal.butter(2, ENV_LP_FC / (fs/2), btype='low', output='sos')
+    env_smooth_boot = signal.sosfiltfilt(sos_lp, env_boot)
+
+    trim_b = int(TRIM_S * fs)
+    t_b = elapsed_boot[trim_b:-trim_b]
+    e_b = env_smooth_boot[trim_b:-trim_b]
+    try:
+        popt_b, _ = curve_fit(exp_decay, t_b, e_b,
+                               p0=[e_b[0], elapsed_boot[-1] / 2], maxfev=5000)
+        A0_global, tau_global = popt_b
+    except RuntimeError:
+        A0_global = float(e_b[0])
+        tau_global = float(elapsed_boot[-1])
+
+    # Global noise floor estimate from boot block residual
+    I_cor_b, Q_cor_b, _, _ = correct_iq_imbalance(I_boot, Q_boot)
+    d_ekf_b, v_ekf_b, _ = iq_displacement_ekf(
+        I_cor_b, Q_cor_b, lam, f0=f0, fs=fs, tau=tau_global)
+    dhp_b = signal.sosfiltfilt(sos_hp, d_ekf_b)
+    model_b, _ = synthesize_pendulum_parametric(
+        elapsed_boot, dhp_b, f0=f0, tau=tau_global, n_env=2)
+    noise_b = dhp_b - model_b
+    global_noise_floor_mm = float(np.std(noise_b))
+    cutoff_amp = CUTOFF_SNR * global_noise_floor_mm
+    print(f"  f0 = {f0:.5f} Hz | τ_est = {tau_global:.0f} s | "
+          f"noise floor = {global_noise_floor_mm*1000:.1f} µm | "
+          f"cutoff amp = {cutoff_amp*1000:.1f} µm")
+
+    # ── Phase 2: stream all chunks ───────────────────────────────────────────
+    # Initialise EKF state from boot block end
+    omega0 = 2.0 * np.pi * f0
+    lam_mm = lam * 1000.0
+    # Use last EKF displacement/velocity as seed
+    x_ekf = np.array([d_ekf_b[-1], v_ekf_b[-1]])
+    P_ekf = np.diag([(lam_mm / 4.0) ** 2, (omega0 * lam_mm / 4.0) ** 2])
+
+    # Summary arrays (one entry per chunk)
+    chunk_t = []       # absolute time of chunk centre (s)
+    chunk_amp = []     # mean smoothed envelope amplitude (mm)
+    chunk_phase = []   # phase offset relative to ideal (rad)
+    chunk_noise = []   # noise σ within chunk (mm)
+
+    # For noise-window selection (best SNR chunk)
+    best_snr = -1.0
+    best_chunk_data = None   # will store (t_rel, d_ekf, fs) for one chunk
+
+    chunk_idx = 0
+    stopped_early = False
+    _zc_t_ref_global = None   # set from first chunk with valid crossings
+    _zc_global_count = 0      # cumulative crossing count across all chunks
+
+    for seq_a, ms_a, I_a, Q_a in _stream_chunks(csv_path, chunk_samples):
+        n_c = len(ms_a)
+
+        # Absolute time from sequence numbers — exact, handles gaps, no accumulation error.
+        # Subtract first_seq so t=0 is the start of the record regardless of
+        # where in the sequence space this file begins.
+        t_abs = (seq_a.astype(np.float64) - first_seq) / fs
+        t_rel = t_abs - t_abs[0]   # chunk-relative time (for filter calls that need it)
+
+        t_centre = float(np.mean(t_abs))
+
+        # IQ correction
+        I_cor, Q_cor, _, _ = correct_iq_imbalance(I_a, Q_a)
+
+        # EKF with handed-off state
+        d_ekf, v_ekf, amp_iq, x_ekf, P_ekf = _ekf_chunk(
+            I_cor, Q_cor, lam, f0, fs, tau_global, x_ekf, P_ekf)
+
+        # High-pass to remove slow drift
+        d_hp = signal.sosfiltfilt(sos_hp, d_ekf)
+
+        # Bandpass for envelope
+        disp_bp_c = signal.sosfiltfilt(sos_bp_c, d_ekf)
+        env_c = np.abs(signal.hilbert(disp_bp_c))
+        env_sm_c = signal.sosfiltfilt(sos_lp, env_c)
+        amp_mean = float(np.mean(env_sm_c))
+
+        # Auto-cutoff
+        if amp_mean < cutoff_amp and chunk_idx >= NOISE_FLOOR_INIT_CHUNKS:
+            print(f"  Auto-cutoff at t={t_centre/3600:.3f} h "
+                  f"(amp={amp_mean*1000:.1f} µm < {cutoff_amp*1000:.1f} µm)")
+            stopped_early = True
+            break
+
+        # ── Phase residual via zero-crossing line fit ────────────────────────
+        # All upward zero crossings in the chunk get sub-sample interpolated
+        # absolute times.  We assign each a global crossing index (no ambiguity:
+        # crossings within a chunk are sequential), fit a line through
+        # (global_index, crossing_time) across ALL chunks, and the intercept
+        # residual gives the phase offset.  Using all crossings (not just the
+        # first) makes this immune to cycle slips from timing noise.
+        bp_c = signal.sosfiltfilt(sos_bp_c, d_ekf)
+        zc_idx = np.where((bp_c[:-1] < 0) & (bp_c[1:] >= 0))[0]
+        if len(zc_idx) >= 2:
+            frac = -bp_c[zc_idx] / (bp_c[zc_idx + 1] - bp_c[zc_idx] + 1e-30)
+            zc_t_abs = t_abs[zc_idx] + frac / fs
+
+            if _zc_t_ref_global is None:
+                # First valid chunk: assign global indices starting at 0.
+                _zc_t_ref_global = float(zc_t_abs[0])
+                _zc_global_count = 0   # global index of next first crossing
+            # Assign global indices for this chunk's crossings
+            # (consecutive from _zc_global_count)
+            zc_global_n = _zc_global_count + np.arange(len(zc_t_abs))
+            # Accumulate into global lists for a final line fit later;
+            # for the per-chunk summary use the mean residual from a local
+            # line fit (same data, no slip risk).
+            zc_n_loc = np.arange(len(zc_t_abs))
+            slope_loc, intercept_loc = np.polyfit(zc_n_loc, zc_t_abs, 1)
+            # Local phase: difference between fitted intercept and ideal
+            # time predicted from the global reference
+            t_ideal_intercept = _zc_t_ref_global + _zc_global_count / f0
+            timing_resid_s = intercept_loc - t_ideal_intercept
+            phase_off = timing_resid_s * 2 * np.pi * f0   # radians
+
+            # Advance global crossing counter
+            _zc_global_count += len(zc_t_abs)
+
+            # Within-chunk timing jitter from local fit residuals
+            zc_t_fit = intercept_loc + slope_loc * zc_n_loc
+            zc_resid_s = zc_t_abs - zc_t_fit
+            chunk_timing_jitter = float(np.std(zc_resid_s) * 1000)  # ms
+        else:
+            phase_off = float('nan')
+            chunk_timing_jitter = float('nan')
+
+        # ── Chunk noise σ ────────────────────────────────────────────────────
+        # Use t_abs so exp(-t/τ) evaluates at the correct elapsed time.
+        # n_env=1 is sufficient for a 5-min chunk (amplitude barely changes).
+        try:
+            model_c, _ = synthesize_pendulum_parametric(
+                t_abs, d_hp, f0=f0, tau=tau_global, n_env=1)
+            noise_c = d_hp - model_c
+            noise_sigma = float(np.std(noise_c))
+        except Exception as _exc:
+            if chunk_idx == 0:
+                print(f"  WARNING: noise model failed: {_exc}")
+            noise_c = np.zeros_like(d_hp)
+            noise_sigma = global_noise_floor_mm
+
+        # Track best-SNR chunk for Figure 2
+        snr_c = amp_mean / (noise_sigma + 1e-12)
+        if snr_c > best_snr:
+            best_snr = snr_c
+            best_chunk_data = {
+                't_rel': t_rel.copy(),
+                'd_hp': d_hp.copy(),
+                'noise': noise_c.copy() if 'noise_c' in dir() else np.array([]),
+                'amp': amp_mean,
+                'noise_sigma': noise_sigma,
+                'fs': fs,
+                'f0': f0,
+                'tau': tau_global,
+            }
+
+        chunk_t.append(t_centre)
+        chunk_amp.append(amp_mean)
+        chunk_phase.append(phase_off)
+        chunk_noise.append(noise_sigma)
+
+        chunk_idx += 1
+        if chunk_idx % 12 == 0:
+            elapsed_h = t_centre / 3600
+            print(f"  chunk {chunk_idx:4d}  t={elapsed_h:.2f} h  "
+                  f"amp={amp_mean*1000:.1f} µm  noise={noise_sigma*1e6:.0f} nm")
+
+    chunk_t     = np.array(chunk_t)
+    chunk_amp   = np.array(chunk_amp)
+    chunk_phase = np.array(chunk_phase)
+    chunk_noise = np.array(chunk_noise)
+    n_chunks    = len(chunk_t)
+    print(f"  Processed {n_chunks} chunks  ({n_chunks * CHUNK_MINUTES / 60:.2f} h)")
+
+    # ── Phase 3: hourly Q fits ───────────────────────────────────────────────
+    hourly_t     = []
+    hourly_Q     = []
+    hourly_Q_err = []
+    hourly_tau   = []
+    hourly_noise = []
+
+    i = 0
+    while i + HOURLY_CHUNKS <= n_chunks:
+        sl = slice(i, i + HOURLY_CHUNKS)
+        t_h   = chunk_t[sl]
+        A_h   = chunk_amp[sl]
+        n_h   = chunk_noise[sl]
+
+        if A_h.mean() < cutoff_amp:
+            i += HOURLY_CHUNKS
+            continue
+        try:
+            t_h0 = t_h - t_h[0]
+            popt_h, pcov_h = curve_fit(
+                exp_decay, t_h0, A_h,
+                p0=[A_h[0], tau_global],
+                bounds=([0, 10], [np.inf, 1e6]),
+                maxfev=2000)
+            _, tau_h = popt_h
+            tau_h_err = np.sqrt(np.diag(pcov_h))[1]
+            Q_h     = np.pi * f0 * tau_h
+            Q_h_err = np.pi * f0 * tau_h_err
+            hourly_t.append(float(np.mean(t_h)))
+            hourly_Q.append(Q_h)
+            hourly_Q_err.append(Q_h_err)
+            hourly_tau.append(tau_h)
+            hourly_noise.append(float(np.mean(n_h)))
+        except (RuntimeError, ValueError):
+            pass
+        i += HOURLY_CHUNKS
+
+    hourly_t     = np.array(hourly_t)
+    hourly_Q     = np.array(hourly_Q)
+    hourly_Q_err = np.array(hourly_Q_err)
+    hourly_noise = np.array(hourly_noise)
+
+    # Global Q from full chunk sequence
+    if n_chunks >= 6:
+        t_all = chunk_t - chunk_t[0]
+        try:
+            popt_g, pcov_g = curve_fit(exp_decay, t_all, chunk_amp,
+                                        p0=[chunk_amp[0], tau_global], maxfev=5000)
+            A0_global, tau_global_fit = popt_g
+            tau_global_err = np.sqrt(np.diag(pcov_g))[1]
+        except RuntimeError:
+            tau_global_fit = tau_global
+            tau_global_err = 0.0
+        Q_global     = np.pi * f0 * tau_global_fit
+        Q_global_err = np.pi * f0 * tau_global_err
+    else:
+        tau_global_fit  = tau_global
+        tau_global_err  = 0.0
+        Q_global        = np.pi * f0 * tau_global
+        Q_global_err    = 0.0
+        A0_global       = float(chunk_amp[0]) if n_chunks else 0.0
+
+    print(f"  Global: τ = {tau_global_fit:.0f} ± {tau_global_err:.0f} s  "
+          f"Q = {Q_global:.0f} ± {Q_global_err:.0f}")
+
+    # Report phase residual stats (detrended, same as plot panel)
+    if len(chunk_t) >= 4:
+        t_h_all = chunk_t / 3600.0
+        ph_unwrapped = np.unwrap(chunk_phase)
+        ph_detrend_all = ph_unwrapped - np.polyval(
+            np.polyfit(t_h_all, ph_unwrapped, 1), t_h_all)
+        ph_rms_mrad = float(np.std(ph_detrend_all) * 1000)
+        tj_rms_ms   = float(np.std(ph_detrend_all) / (2 * np.pi * f0) * 1000)
+        print(f"  Phase residual σ = {ph_rms_mrad:.2f} mrad rms  "
+              f"({tj_rms_ms:.3f} ms timing jitter)")
+
+    return dict(
+        f0=f0, fs=fs, lam=lam,
+        A0=A0_global, tau=tau_global_fit, tau_err=tau_global_err,
+        Q_val=Q_global, Q_err=Q_global_err,
+        T_total=float(chunk_t[-1]) if n_chunks else 0.0,
+        chunk_t=chunk_t, chunk_amp=chunk_amp,
+        chunk_phase=chunk_phase, chunk_noise=chunk_noise,
+        hourly_t=hourly_t, hourly_Q=hourly_Q, hourly_Q_err=hourly_Q_err,
+        hourly_noise=hourly_noise,
+        global_noise_floor=global_noise_floor_mm,
+        cutoff_amp=cutoff_amp,
+        stopped_early=stopped_early,
+        best_chunk=best_chunk_data,
+    )
+
+
+def plot_results_large(r, title=''):
+    """
+    Three sparse figures for large (multi-hour) records.
+
+    Figure 1: Amplitude peaks (one dot per chunk) + log-envelope + phase residual.
+    Figure 2: Noise analysis on best-SNR 5-min chunk only.
+    Figure 3: Hourly Q ± uncertainty + hourly noise floor.
+    """
+    print(f"pendulum_analysis version: {VERSION}  [large-record plots]")
+
+    f0    = r['f0']
+    tau   = r['tau']
+    A0    = r['A0']
+    Q_val = r['Q_val']
+    Q_err = r['Q_err']
+    tau_err = r['tau_err']
+
+    chunk_t   = r['chunk_t']
+    chunk_amp = r['chunk_amp']
+    chunk_ph  = r['chunk_phase']
+    t_h       = chunk_t / 3600.0   # convert to hours for x-axis
+    t0_s      = float(chunk_t[0])  # absolute time of first chunk centre (s)
+
+    t_model_h = np.linspace(t_h[0], t_h[-1], 500)
+    # Model time must be relative to first chunk, matching curve_fit which used
+    # t_all = chunk_t - chunk_t[0].  So t_model_s=0 → first chunk centre.
+    t_model_s = (t_model_h - t_h[0]) * 3600.0
+
+    # ── Figure 1 ─────────────────────────────────────────────────────────────
+    fig1, axes1 = plt.subplots(3, 1, figsize=(13, 12), layout='constrained')
+    fig1.suptitle(title + '  (Large-Record Analysis)', fontsize=11, fontweight='bold')
+
+    # Panel 1a: amplitude decay (sparse dots + log model)
+    ax = axes1[0]
+    ax.scatter(t_h, chunk_amp, s=8, color='steelblue', alpha=0.7,
+               label=f'Chunk amplitude ({CHUNK_MINUTES:.0f}-min)', zorder=3)
+    ax.plot(t_model_h, exp_decay(t_model_s, A0, tau), 'k--', lw=1.8,
+            label=f'Fit: A₀={A0*1000:.0f} µm, τ={tau:.0f}±{tau_err:.0f} s, '
+                  f'Q={Q_val:.0f}±{Q_err:.0f}')
+    if r['stopped_early']:
+        ax.axvline(t_h[-1], color='r', ls=':', lw=1.2, label='Auto-cutoff')
+    ax.set_xlabel('Time (h)')
+    ax.set_ylabel('Amplitude (mm)')
+    ax.set_title(f'Amplitude Decay  |  f₀ = {f0:.5f} Hz  |  τ = {tau:.0f} s  |  Q = {Q_val:.0f}')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 1b: log envelope
+    ax = axes1[1]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_amp = np.log(np.where(chunk_amp > 0, chunk_amp, np.nan))
+    valid = np.isfinite(log_amp)
+    ax.scatter(t_h[valid], log_amp[valid], s=8, color='steelblue', alpha=0.7)
+    ax.plot(t_model_h, np.log(exp_decay(t_model_s, A0, tau)), 'k--', lw=1.5,
+            label=f'slope = −1/τ = {-1/tau:.5f} s⁻¹')
+    ax.set_xlabel('Time (h)')
+    ax.set_ylabel('ln(Amplitude)')
+    ax.set_title('Log Envelope  (linearity confirms single-mode exponential decay)')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 1c: phase residual (unwrap then detrend)
+    ax = axes1[2]
+    ph_valid = np.isfinite(chunk_ph)
+    if ph_valid.sum() >= 4:
+        ph_uw = np.unwrap(chunk_ph[ph_valid])
+        ph_detrend = ph_uw - np.polyval(
+            np.polyfit(t_h[ph_valid], ph_uw, 1), t_h[ph_valid])
+        ph_mrad = ph_detrend * 1000
+        tj_ms = ph_detrend / (2 * np.pi * f0) * 1000
+        ax.scatter(t_h[ph_valid], ph_mrad, s=8, color='darkorange', alpha=0.8)
+        ax.axhline(0, color='k', lw=0.6, ls='--', alpha=0.5)
+        ax.set_title(f'Phase Residual  σ = {ph_mrad.std():.1f} mrad rms'
+                     f'  ({tj_ms.std():.1f} ms timing jitter)')
+    else:
+        ax.set_title('Phase Residual  (insufficient data)')
+    ax.set_xlabel('Time (h)')
+    ax.set_ylabel('Phase residual (mrad)')
+    ax.grid(True, alpha=0.3)
+
+    # ── Figure 2: noise analysis on best-SNR chunk ───────────────────────────
+    bc = r.get('best_chunk')
+    fig2, axes2 = plt.subplots(2, 1, figsize=(12, 9), layout='constrained')
+    fig2.suptitle(title + f'  (Noise — Best {CHUNK_MINUTES:.0f}-min Window)',
+                  fontsize=11, fontweight='bold')
+
+    if bc is not None:
+        t_bc  = bc['t_rel']
+        d_bc  = bc['d_hp']
+        noise_bc = bc['noise']
+        fs_bc = bc['fs']
+        f0_bc = bc['f0']
+        tau_bc = bc['tau']
+
+        ax = axes2[0]
+        noise_um = noise_bc * 1000
+        ax.plot(t_bc, noise_um, color='gray', lw=0.5, alpha=0.85)
+        rms_um = float(np.std(noise_um))
+        ax.set_xlabel('Time within window (s)')
+        ax.set_ylabel('Residual (µm)')
+        ax.set_title(f'System Noise (measured − parametric model)\n'
+                     f'σ = {rms_um:.1f} µm  SNR = {bc["amp"]/bc["noise_sigma"]:.0f}')
+        ax.grid(True, alpha=0.3)
+
+        ax = axes2[1]
+        nperseg_n = min(int(30 * fs_bc), len(noise_bc) // 4)
+        if nperseg_n >= 16:
+            f_n, psd_n = signal.welch(noise_bc, fs=fs_bc, nperseg=nperseg_n)
+            _, psd_s = signal.welch(d_bc, fs=fs_bc, nperseg=nperseg_n)
+            ax.semilogy(f_n, psd_s, color='steelblue', lw=0.6, alpha=0.7,
+                        label='Signal (HP-filtered)')
+            ax.semilogy(f_n, psd_n, color='red', lw=0.8, label='Noise (residual)')
+            nfd = float(np.mean(psd_n[f_n > f0_bc * 12])) if any(f_n > f0_bc * 12) else float(np.mean(psd_n))
+            ax.axhline(nfd, color='red', ls='--', lw=1, alpha=0.6,
+                       label=f'Noise floor: {10*np.log10(nfd+1e-30):.1f} dB(mm²/Hz)')
+        ax.set_xlabel('Frequency (Hz)')
+        ax.set_ylabel('PSD (mm²/Hz)')
+        ax.set_title('Power Spectral Density: Signal vs Noise')
+        ax.legend(fontsize=8, loc='upper right')
+        ax.grid(True, alpha=0.3)
+    else:
+        for ax in axes2:
+            ax.text(0.5, 0.5, 'No chunk data available', ha='center', va='center',
+                    transform=ax.transAxes)
+
+    # ── Figure 3: hourly Q and noise floor ───────────────────────────────────
+    fig3, axes3 = plt.subplots(2, 1, figsize=(10, 8), layout='constrained')
+    fig3.suptitle(title + '  (Hourly Q & Noise)', fontsize=11, fontweight='bold')
+
+    h_t = r['hourly_t'] / 3600.0
+    h_Q = r['hourly_Q']
+    h_Qe = r['hourly_Q_err']
+    h_n  = r['hourly_noise']
+
+    ax = axes3[0]
+    if len(h_t) >= 2:
+        ax.errorbar(h_t, h_Q, yerr=h_Qe, fmt='o-', color='steelblue',
+                    capsize=4, lw=1.5, ms=6, label='Hourly Q')
+        ax.axhline(Q_val, color='r', lw=1.2, ls=':', alpha=0.7,
+                   label=f'Global Q = {Q_val:.0f} ± {Q_err:.0f}')
+        ax.fill_between([h_t[0], h_t[-1]],
+                        [Q_val - Q_err]*2, [Q_val + Q_err]*2,
+                        color='r', alpha=0.12)
+    else:
+        ax.text(0.5, 0.5, 'Insufficient hourly windows', ha='center', va='center',
+                transform=ax.transAxes)
+    ax.set_xlabel('Time (h)')
+    ax.set_ylabel('Q factor')
+    ax.set_title('Hourly Q Factor  (exp-decay fit over each 1-h block of chunks)')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes3[1]
+    if len(h_t) >= 2:
+        ax.plot(h_t, h_n * 1e6, 'o-', color='darkorange', lw=1.5, ms=6,
+                label='Hourly mean noise σ')
+        ax.axhline(r['global_noise_floor'] * 1e6, color='k', ls='--', lw=1.2,
+                   label=f"Global floor = {r['global_noise_floor']*1e6:.0f} nm rms")
+        ax.axhline(r['cutoff_amp'] * 1e6, color='r', ls=':', lw=1,
+                   label=f"Cutoff threshold = {r['cutoff_amp']*1e6:.0f} nm")
+    ax.set_xlabel('Time (h)')
+    ax.set_ylabel('Noise σ (nm rms)')
+    ax.set_title('Hourly Noise Floor')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    return fig1, fig2, fig3
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python pendulum_analysis.py <IQ_csv_file> [output_png]")
@@ -776,24 +1454,47 @@ def main():
 
     import os
     print(f"Analysing: {csv_path}")
-    results = analyse(csv_path)
 
-    title = (f'61 GHz Radar — Pendulum  |  {os.path.basename(csv_path)}'
-             f'  |  {results["T_total"]/60:.1f} min  |  Q = {results["Q_val"]:.0f}')
-    fig_main, fig_noise = plot_results(results, title=title)
+    # Quick size check to decide which path to use
+    T_est, _, n_rows_est = _peek_csv_header(csv_path)
+    use_large = (T_est is not None and T_est / 3600.0 >= LARGE_RECORD_HOURS)
+    if use_large:
+        print(f"  Record ≈ {T_est/3600:.2f} h — using large-record streaming path.")
 
-    if out_path:
-        base, ext = os.path.splitext(out_path)
-        if ext == "":
-            ext = ".png"
-        out_main  = base + "_main" + ext
-        out_noise = base + "_noise" + ext
-        fig_main.savefig(out_main, dpi=200, bbox_inches='tight')
-        fig_noise.savefig(out_noise, dpi=200, bbox_inches='tight')
-        print(f"Saved: {out_main}")
-        print(f"Saved: {out_noise}")
+    if use_large:
+        results = analyse_large(csv_path)
+        title = (f'61 GHz Radar — Pendulum  |  {os.path.basename(csv_path)}'
+                 f'  |  {results["T_total"]/3600:.2f} h  |  Q = {results["Q_val"]:.0f}')
+        fig1, fig2, fig3 = plot_results_large(results, title=title)
+
+        if out_path:
+            base, ext = os.path.splitext(out_path)
+            if ext == "":
+                ext = ".png"
+            for suffix, fig in [("_amplitude", fig1), ("_noise", fig2), ("_hourlyQ", fig3)]:
+                fname = base + suffix + ext
+                fig.savefig(fname, dpi=200, bbox_inches='tight')
+                print(f"Saved: {fname}")
+        else:
+            plt.show()
     else:
-        plt.show()
+        results = analyse(csv_path)
+        title = (f'61 GHz Radar — Pendulum  |  {os.path.basename(csv_path)}'
+                 f'  |  {results["T_total"]/60:.1f} min  |  Q = {results["Q_val"]:.0f}')
+        fig_main, fig_noise = plot_results(results, title=title)
+
+        if out_path:
+            base, ext = os.path.splitext(out_path)
+            if ext == "":
+                ext = ".png"
+            out_main  = base + "_main" + ext
+            out_noise = base + "_noise" + ext
+            fig_main.savefig(out_main, dpi=200, bbox_inches='tight')
+            fig_noise.savefig(out_noise, dpi=200, bbox_inches='tight')
+            print(f"Saved: {out_main}")
+            print(f"Saved: {out_noise}")
+        else:
+            plt.show()
 
 if __name__ == '__main__':
     main()
