@@ -5,7 +5,7 @@ If output_png is omitted the plot is displayed interactively.
 """
 
 
-VERSION = "1.9.6-phase-unwrap"
+VERSION = "1.9.7-peek-fix"
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -797,7 +797,7 @@ def _peek_csv_header(path):
                 break
             if len(row) >= 4:
                 try:
-                    rows_head.append((int(row[1]),))   # ms_raw only
+                    rows_head.append((int(row[0]), int(row[1])))  # seq, ms_raw
                 except ValueError:
                     pass
 
@@ -823,21 +823,21 @@ def _peek_csv_header(path):
     if not rows_head or not rows_tail:
         return None, None, None
 
-    ms0 = rows_head[0][0]
-    # Estimate fs from first block
-    if len(rows_head) > 2:
-        diffs = [rows_head[i+1][0] - rows_head[i][0] for i in range(len(rows_head)-1)
-                 if 0 < rows_head[i+1][0] - rows_head[i][0] < 500]
+    first_seq = rows_head[0][0]
+    last_seq   = rows_tail[-1][0]
+    n_rows_est = last_seq - first_seq + 1   # works regardless of starting seq number
+
+    # Estimate fs from ms timestamps in first block
+    ms_vals = [r[1] for r in rows_head]
+    if len(ms_vals) > 2:
+        diffs = [ms_vals[i+1] - ms_vals[i] for i in range(len(ms_vals)-1)
+                 if 0 < ms_vals[i+1] - ms_vals[i] < 500]
         fs_est = 1000.0 / (sum(diffs)/len(diffs)) if diffs else None
     else:
         fs_est = None
 
-    # Last seq number gives row count
-    last_seq = rows_tail[-1][0]
-    last_ms  = rows_tail[-1][1]
-    # Approximate elapsed: seq numbers start at 0
-    T_est = last_seq / (fs_est if fs_est else 200.0)
-    return T_est, fs_est, last_seq + 1
+    T_est = n_rows_est / (fs_est if fs_est else 200.0)
+    return T_est, fs_est, n_rows_est
 
 
 def _stream_chunks(path, chunk_samples):
