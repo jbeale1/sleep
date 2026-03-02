@@ -5,7 +5,7 @@ If output_png is omitted the plot is displayed interactively.
 """
 
 
-VERSION = "1.3-split-plots-fixed"
+VERSION = "1.8-weighted-Q-fit"
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,14 +14,14 @@ from scipy.optimize import curve_fit
 
 # ── configuration ────────────────────────────────────────────────────────────
 F_RADAR   = 61e9          # Hz  (BGT60LTR11AIP nominal)
-HP_FC     = 0.40          # Hz  high-pass cutoff to remove slow drift
+HP_FC     = 0.10          # Hz  high-pass cutoff to remove slow drift
 BP_BW     = 0.05          # Hz  half-bandwidth of narrow bandpass for phase extraction
-ENV_LP_FC = 0.30          # Hz  low-pass for envelope smoothing
+ENV_LP_FC = 0.15          # Hz  low-pass for envelope smoothing
 TRIM_S    = 3.0           # seconds to trim from each end for envelope fit
 PHASE_TRIM_BW_FACTOR = 2.5  # trim = factor / (π × BP_BW) — covers filter group delay
 SEG_MIN_TOTAL_S  = 300       # minimum record length (s) to attempt segmented Q analysis
-SEG_WIN_S        = 240       # sliding window width (s) for local τ fits
-SEG_STEP_S       = 60        # step between windows (s)
+SEG_WIN_FRAC     = 0.10      # window width as fraction of record length (min 240 s, max 3600 s)
+SEG_STEP_FRAC    = 0.025     # step size as fraction of record length (min 60 s, max 900 s)
 SEG_MIN_AMP_MM   = 0.15      # reject windows with mean amplitude below this (mm)
 SEG_MAX_Q_FACTOR = 3.0       # reject windows where Q > this × median(Q)
 SEG_MAX_TAU_ERR  = 0.15      # reject windows where τ_err/τ exceeds this fraction
@@ -30,6 +30,9 @@ SEG_MAX_TAU_ERR  = 0.15      # reject windows where τ_err/τ exceeds this fract
 NOISE_SMOOTH_S   = 20.0      # seconds — smoothing window for envelope/phase
 NOISE_N_HARMONICS = 10       # number of harmonics to model (fundamental + this many)
 NOISE_BP_BW_MULT = 0.15      # half-bandwidth of each harmonic bandpass, as fraction of f0
+PHASE_TRACK_SMOOTH_S = 5.0   # smoothing window (s) — ~1–2 oscillation periods;
+                              # tracks amplitude-envelope frequency variation while
+                              # averaging out EKF sample noise
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_iq(path):
@@ -77,13 +80,257 @@ def load_iq(path):
     return t, I_raw, Q_raw, fs, T_total
 
 def iq_to_displacement_mm(I_raw, Q_raw):
+    """First-pass displacement via naive unwrap. Used for f0/Q/tau fitting only."""
     lam = 3e8 / F_RADAR
     I   = I_raw - I_raw.mean()
     Q   = Q_raw - Q_raw.mean()
     phase  = np.unwrap(np.arctan2(Q, I))
     return phase * lam / (4 * np.pi) * 1000, lam
 
-def find_fundamental(disp_hp, fs, f_search=(0.5, 2.0)):
+
+def correct_iq_imbalance(I_raw, Q_raw):
+    """
+    Estimate and correct IQ gain imbalance and quadrature phase error.
+
+    Real homodyne receivers have unequal I/Q gains and a quadrature angle
+    that is not exactly 90°.  These cause the IQ phasor to trace an ellipse
+    instead of a circle, creating a systematic displacement error that repeats
+    identically on every oscillation cycle (visible as a deterministic residual
+    at the oscillation frequency and its harmonics).
+
+    The correction is estimated from high-amplitude samples, where the phasor
+    fully traverses the I/Q plane.  For a pendulum with swing >> λ/2 (true
+    here: ~8 mm ≈ 3.3 × λ/2), the phasor makes multiple complete rotations
+    per half-swing, so the I and Q channels are approximately uniformly sampled
+    over the circle — giving an unbiased estimate of the imbalance.
+
+    Correction model applied:
+        I_cor = I                          (I channel is reference)
+        Q_cor = (Q − cross × I) × (g_I/g_Q)   (remove I→Q leak, equalize gain)
+
+    Parameters
+    ----------
+    I_raw, Q_raw : raw ADC arrays (with DC bias)
+
+    Returns
+    -------
+    I_cor_raw, Q_cor_raw : corrected arrays (same DC offset as inputs so they
+                           can be dropped into any function that re-centres)
+    g_ratio              : g_I / g_Q (diagnostic)
+    cross_mrad           : quadrature error in mrad (diagnostic)
+    """
+    I = I_raw - I_raw.mean()
+    Q = Q_raw - Q_raw.mean()
+    amp = np.abs(I + 1j * Q)
+
+    # Use only samples with amplitude > 30% of median to avoid biasing the
+    # estimate using near-zero samples at the turning points.
+    mask = amp > 0.30 * np.median(amp)
+    I_hi, Q_hi = I[mask], Q[mask]
+
+    g_I    = np.sqrt(np.mean(I_hi ** 2))
+    g_Q    = np.sqrt(np.mean(Q_hi ** 2))
+    cross  = np.mean(I_hi * Q_hi) / np.mean(I_hi ** 2)   # I→Q leakage fraction
+
+    # Apply correction (keep I as the amplitude reference)
+    I_cor = I
+    Q_cor = (Q - cross * I) * (g_I / g_Q)
+
+    return (I_cor + I_raw.mean(),
+            Q_cor + Q_raw.mean(),
+            g_I / g_Q,
+            float(cross * 1000))   # g_ratio, cross in mrad
+
+
+def iq_displacement_ekf(I_raw, Q_raw, lam, f0, fs, tau=None,
+                         process_noise_mm=1e-4, meas_noise_frac=0.005):
+    """
+    Extract displacement via an Extended Kalman Filter on the raw IQ phasor.
+
+    State:  x = [d (mm), v (mm/s)]
+    Process model: discrete exact harmonic oscillator.
+    Measurement:   unit IQ phasor [Re(z/|z|), Im(z/|z|)] — 2-element real vector.
+    Measurement noise covariance R = (σ_base / amp_norm)² × I₂.
+
+    When the IQ amplitude collapses near zero at the pendulum turning points
+    (the phasor physically passes through the origin because the large swing
+    ~8 mm ≈ 3×λ/2 causes the IQ circle to wrap through it), R grows by orders
+    of magnitude, driving the Kalman gain to near zero.  The harmonic-oscillator
+    dynamics then carry the state through the turning point without any phase
+    extraction — eliminating the large spikes that corrupt the naive unwrap.
+
+    Parameters
+    ----------
+    I_raw, Q_raw       : raw ADC arrays (DC bias removed internally)
+    lam                : radar wavelength (m)
+    f0                 : pendulum fundamental frequency (Hz)
+    fs                 : sample rate (Hz)
+    tau                : exponential decay time constant (s); optional
+    process_noise_mm   : position process-noise σ per sample (mm)
+    meas_noise_frac    : IQ noise as fraction of median amplitude
+
+    Returns
+    -------
+    d_out (mm), v_out (mm/s), amp (IQ amplitude array)
+    """
+    dt = 1.0 / fs
+    omega0 = 2.0 * np.pi * f0
+    lam_mm = lam * 1000.0
+
+    I = I_raw - I_raw.mean()
+    Q = Q_raw - Q_raw.mean()
+    z   = I + 1j * Q
+    amp = np.abs(z)
+    amp_median = np.median(amp)
+    n = len(z)
+
+    c, s = np.cos(omega0 * dt), np.sin(omega0 * dt)
+    F_mat = np.array([[c,  s / omega0],
+                      [-omega0 * s, c]])
+    if tau is not None:
+        F_mat *= np.exp(-dt / tau)
+
+    qp = process_noise_mm ** 2
+    qv = (omega0 * process_noise_mm) ** 2
+    Q_proc = np.diag([qp, qv])
+
+    phi_init = np.arctan2(Q[0], I[0])
+    x = np.array([phi_init * lam_mm / (4.0 * np.pi), 0.0])
+    P = np.diag([(lam_mm / 4.0) ** 2, (omega0 * lam_mm / 4.0) ** 2])
+
+    k4pi_lam = 4.0 * np.pi / lam_mm
+    d_out = np.empty(n); v_out = np.empty(n)
+
+    for k in range(n):
+        x = F_mat @ x
+        P = F_mat @ P @ F_mat.T + Q_proc
+
+        phi_pred = k4pi_lam * x[0]
+        cos_p = np.cos(phi_pred); sin_p = np.sin(phi_pred)
+        H = np.array([[-sin_p * k4pi_lam, 0.0],
+                      [ cos_p * k4pi_lam, 0.0]])
+
+        amp_norm = amp[k] / amp_median
+        r = (meas_noise_frac / max(amp_norm, 1e-4)) ** 2
+        R_mat = r * np.eye(2)
+
+        z_unit = z[k] / (amp[k] + 1e-12)
+        y = np.array([z_unit.real - cos_p, z_unit.imag - sin_p])
+        S = H @ P @ H.T + R_mat
+        K = P @ H.T @ np.linalg.inv(S)
+        x = x + K @ y
+        P = (np.eye(2) - K @ H) @ P
+
+        d_out[k] = x[0]; v_out[k] = x[1]
+
+    return d_out, v_out, amp
+
+
+def synthesize_pendulum_parametric(t, disp_hp, f0, tau,
+                                    n_harmonics=NOISE_N_HARMONICS,
+                                    n_env=1,
+                                    phi_tracked=None):
+    """
+    Multi-harmonic pendulum model fitted by least squares.
+
+    Basis: exp(−n·t/τ) × cos(h·φ(t))  and  exp(−n·t/τ) × sin(h·φ(t))
+    for harmonics h = 1…n_harmonics and envelope powers n = 1…n_env.
+
+    When phi_tracked is supplied (the preferred path), φ(t) is the actual
+    accumulated phase from ekf_tracked_phase().  The basis functions then
+    track whatever slow frequency variations actually occurred — temperature
+    drift of the pendulum length, amplitude-dependent frequency shift,
+    nonlinear damping — without needing higher-order envelope powers.
+    n_env=1 is sufficient in this case.
+
+    When phi_tracked is None the basis falls back to fixed ω₀·t with
+    n_env=2 envelope terms, which captures the leading-order A²
+    amplitude-frequency coupling analytically and avoids the hourglass
+    residual on long records.
+
+    Returns
+    -------
+    model, harmonic_info
+    """
+    fs_approx = 1.0 / (t[1] - t[0])
+
+    if phi_tracked is not None:
+        phi = phi_tracked
+        n_env_use = n_env
+    else:
+        phi = 2.0 * np.pi * f0 * t
+        n_env_use = max(n_env, 2)   # need n=2 without phase tracking
+
+    cols = []; active_harmonics = []
+    for h in range(1, n_harmonics + 1):
+        if f0 * h >= 0.45 * fs_approx:
+            break
+        for n in range(1, n_env_use + 1):
+            env_n = np.exp(-n * t / tau)
+            cols.append(env_n * np.cos(h * phi))
+            cols.append(env_n * np.sin(h * phi))
+        active_harmonics.append(h)
+
+    A_mat = np.column_stack(cols)
+    coeffs, _, _, _ = np.linalg.lstsq(A_mat, disp_hp, rcond=None)
+    model = A_mat @ coeffs
+
+    harmonic_info = []
+    for i, h in enumerate(active_harmonics):
+        a, b = coeffs[2 * n_env_use * i], coeffs[2 * n_env_use * i + 1]
+        harmonic_info.append((h, f0 * h, np.sqrt((a ** 2 + b ** 2) / 2.0)))
+
+    return model, harmonic_info
+
+
+def ekf_tracked_phase(d_ekf, v_ekf, f0, fs,
+                       smooth_s=PHASE_TRACK_SMOOTH_S):
+    """
+    Extract a smoothly-varying accumulated oscillation phase from the EKF state.
+
+    The EKF gives smooth d(t) and v(t), so the angle atan2(−v/ω₀, d) is
+    well-defined everywhere including at turning points (d≈A_max, v≈0),
+    unlike the Hilbert transform which is singular there.
+
+    Crucially, only the *deviation* from the global ω₀ is tracked here.
+    The mean instantaneous frequency from the EKF state may carry a small
+    systematic bias; using it directly would accumulate a large phase drift.
+    Instead, the tracked phase is: φ(t) = ω₀·t + δφ(t), where δφ is the
+    smoothed integral of (ω_inst − ω₀).  The correction is then only the
+    slow, physically meaningful part of the frequency variation.
+
+    Parameters
+    ----------
+    d_ekf, v_ekf : EKF position (mm) and velocity (mm/s)
+    f0           : nominal pendulum frequency (Hz) — sets the phase reference
+    fs           : sample rate (Hz)
+    smooth_s     : moving-average window (s); default 5 s ≈ 1–2 periods
+
+    Returns
+    -------
+    phi_tracked  : accumulated oscillation phase (rad), same length as d_ekf
+    """
+    omega0 = 2.0 * np.pi * f0
+    phi_raw = np.unwrap(np.arctan2(-v_ekf / omega0, d_ekf))
+    omega_inst = np.gradient(phi_raw) * fs
+
+    win = max(int(smooth_s * fs), 3)
+    if win % 2 == 0:
+        win += 1
+    kernel = np.ones(win) / win
+    delta_omega = np.convolve(omega_inst - omega0, kernel, mode='same')
+    half = win // 2
+    delta_omega[:half]  = delta_omega[half]
+    delta_omega[-half:] = delta_omega[-half - 1]
+
+    # Integrate the slow frequency deviation and add to the reference ω₀·t
+    t_arr = np.arange(len(d_ekf)) / fs
+    delta_phi = np.cumsum(delta_omega) / fs
+    delta_phi -= delta_phi[0]   # zero the initial offset
+    return omega0 * t_arr + delta_phi
+
+
+def find_fundamental(disp_hp, fs, f_search=(0.1, 2.0)):
     N   = len(disp_hp)
     win = np.hanning(N)
     D   = np.fft.rfft(disp_hp * win)
@@ -102,8 +349,11 @@ def segmented_Q(t_fit, env_fit, f0, fs):
     Returns arrays of window-centre time, mean amplitude, and local Q.
     Only windows with a plausible fit are kept.
     """
-    win_n  = int(SEG_WIN_S * fs)
-    step_n = int(SEG_STEP_S * fs)
+    T_total_s = t_fit[-1] - t_fit[0]
+    seg_win_s  = float(np.clip(T_total_s * SEG_WIN_FRAC,  240,  3600))
+    seg_step_s = float(np.clip(T_total_s * SEG_STEP_FRAC,  60,   900))
+    win_n  = int(seg_win_s  * fs)
+    step_n = int(seg_step_s * fs)
     trim   = int(TRIM_S * fs)
 
     seg_t, seg_A, seg_Q = [], [], []
@@ -123,7 +373,7 @@ def segmented_Q(t_fit, env_fit, f0, fs):
                 continue
             # Initial guess: tau from ratio over window
             ratio = env_w[0] / (env_w[-1] + 1e-9)
-            tau0  = SEG_WIN_S / np.log(max(ratio, 1.01))
+            tau0  = seg_win_s / np.log(max(ratio, 1.01))
             popt, pcov = curve_fit(
                 exp_decay, t_w - t_w[0], env_w,
                 p0=[env_w[0], tau0],
@@ -152,7 +402,7 @@ def segmented_Q(t_fit, env_fit, f0, fs):
         keep  = seg_Q <= SEG_MAX_Q_FACTOR * q_med
         seg_t, seg_A, seg_Q = seg_t[keep], seg_A[keep], seg_Q[keep]
 
-    return seg_t, seg_A, seg_Q
+    return seg_t, seg_A, seg_Q, seg_win_s
 
 
 def synthesize_pendulum(disp_hp, fs, f0, n_harmonics=NOISE_N_HARMONICS):
@@ -280,16 +530,36 @@ def analyse(csv_path):
     print(f"  Timing jitter  σ = {timing_jitter.std()*1000:.3f} ms rms")
 
     # ── segmented Q (only for long records) ──────────────────────────────────
-    seg_t, seg_A, seg_Q = (np.array([]),) * 3
+    seg_t, seg_A, seg_Q, seg_win_s = (np.array([]),) * 3 + (240.0,)
     if T_total >= SEG_MIN_TOTAL_S:
-        seg_t, seg_A, seg_Q = segmented_Q(t_fit, env_fit, f0, fs)
+        seg_t, seg_A, seg_Q, seg_win_s = segmented_Q(t_fit, env_fit, f0, fs)
         if len(seg_Q):
             print(f"  Q range (segments): {seg_Q.min():.0f} – {seg_Q.max():.0f}"
                   f"  over A = {seg_A.max():.2f} – {seg_A.min():.2f} mm")
 
-    # ── noise analysis: subtract synthesized pendulum from measured ────────────
-    model, harmonic_info = synthesize_pendulum(disp_hp, fs, f0)
-    noise = disp_hp - model
+    # ── noise analysis ────────────────────────────────────────────────────────
+    I_cor, Q_cor, iq_g_ratio, iq_cross_mrad = correct_iq_imbalance(I_raw, Q_raw)
+    print(f"  IQ correction: gain ratio = {iq_g_ratio:.4f}, "
+          f"quadrature error = {iq_cross_mrad:.2f} mrad")
+
+    disp_ekf, v_ekf, amp_iq = iq_displacement_ekf(
+        I_cor, Q_cor, lam, f0=f0, fs=fs, tau=tau,
+        process_noise_mm=1e-4, meas_noise_frac=0.005)
+    disp_hp_ekf = signal.sosfiltfilt(sos_hp, disp_ekf)
+
+    noise_trim = max(trim, int(5 * fs))
+    t_noise   = t[noise_trim:-noise_trim]
+    dhp_noise = disp_hp_ekf[noise_trim:-noise_trim]
+
+    # Parametric harmonic model with dual-envelope basis.
+    # Basis: exp(−n·t/τ) × cos/sin(h·ω₀·t) for n=1,2 and h=1..N_harmonics.
+    # The n=2 terms absorb the large-angle pendulum frequency shift (ω ∝ 1−A²/8)
+    # whose integral over the exponentially-decaying amplitude grows as
+    # exp(−2t/τ), correcting the hourglass residual on long records.
+    model, harmonic_info = synthesize_pendulum_parametric(
+        t_noise, dhp_noise, f0=f0, tau=tau,
+        phi_tracked=None, n_env=2)
+    noise = dhp_noise - model
     noise_rms_mm = np.std(noise)
     # Convert to phase noise
     noise_rms_rad = noise_rms_mm / 1000 * (4 * np.pi) / lam
@@ -315,7 +585,7 @@ def analyse(csv_path):
     noise_win_n = int(noise_win_s * fs)
     noise_t_local, noise_rms_local = [], []
     for i in range(0, len(noise) - noise_win_n, noise_win_n // 2):
-        noise_t_local.append(t[i + noise_win_n // 2])
+        noise_t_local.append(t_noise[i + noise_win_n // 2])
         noise_rms_local.append(np.std(noise[i:i + noise_win_n]))
     noise_t_local = np.array(noise_t_local)
     noise_rms_local = np.array(noise_rms_local)
@@ -337,9 +607,9 @@ def analyse(csv_path):
         log_env=log_env, log_model=log_model,
         phase_resid=phase_resid, timing_jitter=timing_jitter,
         T_total=T_total,
-        seg_t=seg_t, seg_A=seg_A, seg_Q=seg_Q,
+        seg_t=seg_t, seg_A=seg_A, seg_Q=seg_Q, seg_win_s=seg_win_s,
         # noise analysis
-        model=model, noise=noise,
+        model=model, noise=noise, t_noise=t_noise,
         noise_rms_mm=noise_rms_mm, noise_rms_rad=noise_rms_rad,
         f_noise=f_noise, psd_noise=psd_noise, psd_signal=psd_signal,
         noise_floor_density=noise_floor_density,
@@ -422,21 +692,22 @@ def plot_results(r, title=''):
     # Panel 4: segmented Q vs amplitude (optional)
     if has_seg:
         ax = axes1[3]
+        T_seg = r.get('seg_win_s', 240)
         sc = ax.scatter(seg_A, seg_Q, c=seg_t, cmap='plasma',
-                        s=40, zorder=3, label=f'Local Q ({SEG_WIN_S:.0f} s window)')
+                        s=40, zorder=3, label=f'Local Q ({T_seg:.0f} s window)')
         cb = fig1.colorbar(sc, ax=ax, pad=0.02)
         cb.set_label('Window centre time (s)', fontsize=9)
 
         if seg_A.max() / max(seg_A.min(), 1e-12) > 1.5:
-            try:
-                popt_q, _ = curve_fit(lambda A, k: k/A, seg_A, seg_Q,
-                                      p0=[seg_Q.mean() * seg_A.mean()])
-                k_fit = popt_q[0]
-                A_line = np.linspace(seg_A.min()*0.9, seg_A.max()*1.05, 200)
-                ax.plot(A_line, k_fit / A_line, 'k--', lw=1.5,
-                        label=f'Q = {k_fit:.1f} / A  (quadratic drag)')
-            except RuntimeError:
-                pass
+            # Fit Q = k/A weighted by A².
+            # The model Q·A = k means minimising Σ(Q·A − k)² gives k = mean(Q·A),
+            # which is equivalent to weighting each point by A² in Q-space.
+            # This prevents noisy low-amplitude windows (where τ is poorly
+            # constrained and Q is overestimated) from dominating the fit.
+            k_fit = float(np.average(seg_Q * seg_A, weights=seg_A ** 2))
+            A_line = np.linspace(seg_A.min()*0.9, seg_A.max()*1.05, 200)
+            ax.plot(A_line, k_fit / A_line, 'k--', lw=1.5,
+                    label=f'Q = {k_fit:.1f} / A  (quadratic drag)')
 
         ax.axhline(Q_val, color='r', lw=1.2, ls=':', alpha=0.7,
                    label=f'Global fit Q = {Q_val:.0f}')
@@ -453,8 +724,9 @@ def plot_results(r, title=''):
     # Panel 1: noise residual time series
     ax = axes2[0]
     noise = r['noise']
+    t_noise = r.get('t_noise', t)
     noise_um = noise * 1000  # mm → µm
-    ax.plot(t, noise_um, color='gray', lw=0.2, alpha=0.5)
+    ax.plot(t_noise, noise_um, color='gray', lw=0.5, alpha=0.85)
     if len(r.get('noise_rms_local', [])) > 0:
         ax.plot(r['noise_t_local'], r['noise_rms_local'] * 1000,
                 color='red', lw=1.5, label='Local RMS (10 s)')
