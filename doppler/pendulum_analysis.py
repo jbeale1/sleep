@@ -1445,14 +1445,44 @@ def plot_results_large(r, title=''):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python pendulum_analysis.py <IQ_csv_file> [output_png]")
-        sys.exit(1)
+    import argparse, os, tempfile
+    from collections import deque
 
-    csv_path = sys.argv[1]
-    out_path = sys.argv[2] if len(sys.argv) >= 3 else None
+    parser = argparse.ArgumentParser(
+        description='Analyse IQ CSV file for pendulum parameters')
+    parser.add_argument('csv_path', help='Input IQ CSV file')
+    parser.add_argument('output_png', nargs='?', help='Optional output PNG base path')
+    parser.add_argument('--last-hours', type=float, default=None,
+                        help='Process only the last X.X hours of the input file (sample rate = 142.34 Hz)')
+    args = parser.parse_args()
 
-    import os
+    csv_path = args.csv_path
+    out_path = args.output_png
+
+    tmp_trimmed = None
+    # If requested, create a temporary CSV containing only the last N samples
+    if args.last_hours is not None and args.last_hours > 0:
+        SAMPLE_RATE_FOR_TRIM = 142.34
+        n_samples = int(args.last_hours * 3600.0 * SAMPLE_RATE_FOR_TRIM)
+        if n_samples <= 0:
+            print('Requested --last-hours too small; ignoring.')
+        else:
+            print(f"Trimming to last {args.last_hours:.3f} h -> {n_samples} samples")
+            # Read header + last n_samples lines efficiently
+            last_lines = deque(maxlen=n_samples)
+            with open(csv_path, 'r', newline='') as f_in:
+                header = f_in.readline()
+                for line in f_in:
+                    last_lines.append(line)
+            # Write to temporary file
+            tf = tempfile.NamedTemporaryFile('w', delete=False, newline='', suffix='.csv')
+            tmp_trimmed = tf.name
+            with tf:
+                tf.write(header)
+                for line in last_lines:
+                    tf.write(line)
+            csv_path = tmp_trimmed
+
     print(f"Analysing: {csv_path}")
 
     # Quick size check to decide which path to use
@@ -1495,6 +1525,12 @@ def main():
             print(f"Saved: {out_noise}")
         else:
             plt.show()
+    # Clean up temporary trimmed file if created
+    if tmp_trimmed is not None:
+        try:
+            os.unlink(tmp_trimmed)
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     main()

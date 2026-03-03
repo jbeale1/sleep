@@ -8,7 +8,7 @@ from datetime import datetime
 PORT = '/dev/ttyACM0'
 #PORT = '/dev/ttyACM2'
 BAUD = 115200
-SAMPLE_RATE = 142.3        # approximate samples per second
+SAMPLE_RATE = 142.34       # approximate samples per second
 HISTORY = 1000             # number of points to display
 PKPK_WINDOW = 200          # samples over which to compute pk-pk readout
 COUNTS_PER_VOLT = 8388608 / 5.0   # ADS1256 PGA=1, Vref=2.5V, single-ended
