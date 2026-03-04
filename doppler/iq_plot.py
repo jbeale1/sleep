@@ -28,7 +28,12 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 parser = argparse.ArgumentParser()
 parser.add_argument('--autostart', action='store_true',
                     help=f'Auto-start recording after {AUTO_REC_DELAY:.0f}s countdown (text-only, no GUI)')
+parser.add_argument('--csv', '-c', help='Path to CSV file to playback instead of reading serial')
 args = parser.parse_args()
+
+if args.autostart and args.csv:
+    print('Error: --autostart is for recording from serial; --csv is for playback.')
+    sys.exit(1)
 
 # --- Text-only mode: runs entirely before any GUI imports ---
 if args.autostart:
@@ -117,6 +122,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.widgets import Button
 from collections import deque
+import csv
 
 # --- Recording state ---
 recording = False
@@ -140,8 +146,40 @@ prev_ms_val = None          # previous raw ms%1000 value
 xs = deque(maxlen=HISTORY)
 ys = deque(maxlen=HISTORY)
 
-# --- Serial setup ---
-ser = serial.Serial(PORT, BAUD, timeout=1)
+# --- Serial / CSV setup ---
+csv_mode = bool(args.csv)
+csv_samples = []
+csv_index = 0
+playback_origin_monotonic = None
+csv_base_ms = 0
+
+if csv_mode:
+    # Preload CSV and compute unwrapped absolute ms timestamps
+    try:
+        with open(args.csv, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            prev_ms_val = None
+            unwrapped = 0
+            for r in reader:
+                try:
+                    seq = int(r.get('seq') or r.get('seq\n'))
+                    ms = int(r.get('ms'))
+                    i = int(r.get('I') or r.get('i'))
+                    q = int(r.get('Q') or r.get('q'))
+                except Exception:
+                    continue
+                if prev_ms_val is not None and ms < prev_ms_val - 500:
+                    unwrapped += 1000
+                prev_ms_val = ms
+                abs_ms = unwrapped + ms
+                csv_samples.append((seq, abs_ms, i, q))
+        if csv_samples:
+            csv_base_ms = csv_samples[0][1]
+    except FileNotFoundError:
+        print(f'CSV file not found: {args.csv}')
+        sys.exit(1)
+else:
+    ser = serial.Serial(PORT, BAUD, timeout=1)
 
 # --- Wall-clock reference (for elapsed display even when not recording) ---
 t_run_origin = None
@@ -260,12 +298,88 @@ def read_serial_line():
         pass
     return None
 
+
+def _handle_sample(seq_num, ms_val, i_val, q_val, now, source_csv=False):
+    """Common handling for a single sample (serial or CSV).
+    If source_csv is True, ms_val is treated as absolute unwrapped ms."""
+    global t_run_origin, rec_sample_count, last_seq, total_dropped
+    global rate_seq_start, rate_ms_start, rate_last_update, measured_rate
+    global unwrapped_ms, prev_ms_val
+
+    if t_run_origin is None:
+        t_run_origin = now
+
+    # Sequence gap detection
+    if last_seq is not None:
+        gap = seq_num - last_seq - 1
+        if gap < 0:
+            gap = (seq_num + 0x100000000 - last_seq - 1)  # uint32 wrap
+        if gap > 0 and gap < 100000:
+            total_dropped += gap
+            print(f"WARNING: {gap} samples dropped at seq {seq_num}")
+    last_seq = seq_num
+
+    if recording and log_file is not None:
+        log_file.write(f'{seq_num},{ms_val},{i_val},{q_val}\n')
+        rec_sample_count += 1
+        if stdout_until is not None:
+            if time.monotonic() <= stdout_until:
+                print(f'{seq_num},{ms_val},{i_val},{q_val}')
+            else:
+                # stop echoing
+                pass
+
+    xs.append(i_val)
+    ys.append(q_val)
+
+    # Determine current milliseconds value for rate calculation
+    if source_csv:
+        cur_ms = ms_val
+    else:
+        if prev_ms_val is not None and ms_val < prev_ms_val - 500:
+            unwrapped_ms += 1000  # rollover
+        prev_ms_val = ms_val
+        cur_ms = unwrapped_ms + ms_val
+
+    # Update measured rate ~once per second (using RP2040 timebase)
+    if rate_seq_start is None:
+        rate_seq_start = seq_num
+        rate_ms_start = cur_ms
+        rate_last_update = now
+    elif now - rate_last_update >= 1.0:
+        d_seq = seq_num - rate_seq_start
+        d_ms = cur_ms - rate_ms_start
+        if d_ms > 0 and d_seq > 0:
+            measured_rate = 1000.0 * d_seq / d_ms
+        rate_seq_start = seq_num
+        rate_ms_start = cur_ms
+        rate_last_update = now
+
 def update(_frame):
     global t_run_origin, rec_sample_count, countdown_until, last_seq, total_dropped
     global rate_seq_start, rate_ms_start, rate_last_update, measured_rate
     global unwrapped_ms, prev_ms_val
-    waiting = ser.in_waiting
-    lines_to_read = max(1, waiting // 20)
+    global csv_mode, csv_index, playback_origin_monotonic, csv_samples, csv_base_ms
+    now = time.monotonic()
+
+    if csv_mode:
+        # Playback from preloaded CSV at recorded real-time rate
+        if playback_origin_monotonic is None and csv_index < len(csv_samples):
+            # start playback aligned to now
+            globals()['playback_origin_monotonic'] = now
+        # emit any samples whose recorded time has arrived
+        while csv_index < len(csv_samples):
+            rel_ms = csv_samples[csv_index][1] - csv_base_ms
+            if now - playback_origin_monotonic >= rel_ms / 1000.0:
+                seq_num, ms_val, i_val, q_val = csv_samples[csv_index]
+                globals()['csv_index'] = csv_index + 1
+                _handle_sample(seq_num, ms_val, i_val, q_val, now, source_csv=True)
+            else:
+                break
+        lines_to_read = 0
+    else:
+        waiting = ser.in_waiting
+        lines_to_read = max(1, waiting // 20)
 
     if recording and rec_start_time is not None:
         if time.monotonic() - rec_start_time >= MAX_RECORD_SEC:
@@ -276,54 +390,12 @@ def update(_frame):
         countdown_until = None
         _begin_recording()
 
-    for _ in range(lines_to_read):
-        sample = read_serial_line()
-        if sample:
-            seq_num, ms_val, i_val, q_val = sample
-            now = time.monotonic()
-            if t_run_origin is None:
-                t_run_origin = now
-
-            # Sequence gap detection
-            if last_seq is not None:
-                gap = seq_num - last_seq - 1
-                if gap < 0:
-                    gap = (seq_num + 0x100000000 - last_seq - 1)  # uint32 wrap
-                if gap > 0 and gap < 100000:
-                    total_dropped += gap
-                    print(f"WARNING: {gap} samples dropped at seq {seq_num}")
-            last_seq = seq_num
-
-            if recording and log_file is not None:
-                log_file.write(f'{seq_num},{ms_val},{i_val},{q_val}\n')
-                rec_sample_count += 1
-                if stdout_until is not None:
-                    if time.monotonic() <= stdout_until:
-                        print(f'{seq_num},{ms_val},{i_val},{q_val}')
-                    else:
-                        stdout_until = None
-            xs.append(i_val)
-            ys.append(q_val)
-
-            # Track unwrapped milliseconds from RP2040's ms%1000
-            if prev_ms_val is not None and ms_val < prev_ms_val - 500:
-                unwrapped_ms += 1000  # rollover
-            prev_ms_val = ms_val
-            cur_ms = unwrapped_ms + ms_val
-
-            # Update measured rate ~once per second (using RP2040 timebase)
-            if rate_seq_start is None:
-                rate_seq_start = seq_num
-                rate_ms_start = cur_ms
-                rate_last_update = now
-            elif now - rate_last_update >= 1.0:
-                d_seq = seq_num - rate_seq_start
-                d_ms = cur_ms - rate_ms_start
-                if d_ms > 0 and d_seq > 0:
-                    measured_rate = 1000.0 * d_seq / d_ms
-                rate_seq_start = seq_num
-                rate_ms_start = cur_ms
-                rate_last_update = now
+    if not csv_mode:
+        for _ in range(lines_to_read):
+            sample = read_serial_line()
+            if sample:
+                seq_num, ms_val, i_val, q_val = sample
+                _handle_sample(seq_num, ms_val, i_val, q_val, time.monotonic(), source_csv=False)
 
     if len(xs) < 2:
         return trail_scatter, head_scatter, status_text
@@ -391,7 +463,8 @@ ani = animation.FuncAnimation(
 try:
     plt.show()
 finally:
-    ser.close()
+    if not csv_mode:
+        ser.close()
     if log_file is not None:
         log_file.close()
         drop_str = f", {total_dropped} dropped" if total_dropped else ""
