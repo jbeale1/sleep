@@ -86,6 +86,13 @@ def process(csv_path, out_path=None):
     # lowpass smooth roll (~60s window)
     roll_lp_sos = butter(2, ROLL_LP, btype='low', fs=fs, output='sos')
     roll_smooth = sosfiltfilt(roll_lp_sos, roll)
+
+    # zero-reference roll to dominant (supine) position via mode of integer-rounded values
+    roll_int = np.round(roll_smooth).astype(int)
+    values, counts = np.unique(roll_int, return_counts=True)
+    roll_offset = int(values[np.argmax(counts)])
+    print(f"Roll offset (mode): {roll_offset}°")
+    roll_smooth = (roll_smooth - roll_offset + 180) % 360 - 180
     breath_filt = sosfiltfilt(breath_sos, pitch)
 
     # Hilbert envelope + smoothing

@@ -101,13 +101,17 @@ def main():
     ap.add_argument("csv", help="IQ CSV with columns: seq, ms, I, Q")
     ap.add_argument("--fs", type=float, default=142.34, help="Sample rate (sps)")
     ap.add_argument("--f0", type=float, default=0.32192, help="Nominal frequency (Hz)")
-    ap.add_argument("--A0", type=float, default=0.573, help="Nominal displacement amplitude (mm)")
+    ap.add_argument("--A0", type=float, default=5.3, help="Nominal displacement amplitude (mm)")
     ap.add_argument("--rf_ghz", type=float, default=61.0, help="Radar RF center frequency (GHz)")
     ap.add_argument("--iq_lp_hz", type=float, default=5.0,
                     help="Lowpass cutoff for complex IQ before differentiating (Hz)")
     ap.add_argument("--env_lp_hz", type=float, default=0.05,
                     help="Lowpass cutoff for complex envelope V(t) after demod (Hz). "
                          "Set based on how slow you expect drift (e.g., 0.02–0.2).")
+    ap.add_argument("--last-hours", type=float, default=None,
+                    help="If set, only use the last X hours of data from the input CSV (floating-point hours).")
+    ap.add_argument("--first-hours", type=float, default=None,
+                    help="If set, only use the first X hours of data from the input CSV (floating-point hours). Mutually exclusive with --last-hours.")
     ap.add_argument("--gate_abs", type=float, default=0.20,
                     help="Gate threshold on |z| (after whitening+IQ LP). Below this, "
                          "omega is marked NaN then interpolated.")
@@ -116,6 +120,31 @@ def main():
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
+
+    # Optionally trim to first/last X hours of data (based on sample rate fs)
+    if args.first_hours is not None and args.last_hours is not None:
+        raise ValueError("--first-hours and --last-hours are mutually exclusive")
+
+    if args.first_hours is not None:
+        if args.first_hours <= 0:
+            raise ValueError("--first-hours must be positive")
+        n_samples = int(round(float(args.first_hours) * 3600.0 * float(args.fs)))
+        if n_samples < 2:
+            raise ValueError("--first-hours yields fewer than 2 samples; increase value")
+        if len(df) > n_samples:
+            df = df.head(n_samples).reset_index(drop=True)
+            print(f"Using first {args.first_hours} hours -> {n_samples} samples")
+
+    elif args.last_hours is not None:
+        if args.last_hours <= 0:
+            raise ValueError("--last-hours must be positive")
+        # compute number of samples corresponding to requested hours
+        n_samples = int(round(float(args.last_hours) * 3600.0 * float(args.fs)))
+        if n_samples < 2:
+            raise ValueError("--last-hours yields fewer than 2 samples; increase value")
+        if len(df) > n_samples:
+            df = df.tail(n_samples).reset_index(drop=True)
+            print(f"Using last {args.last_hours} hours -> {n_samples} samples")
 
     for col in ("seq", "I", "Q"):
         if col not in df.columns:
@@ -136,6 +165,65 @@ def main():
     sos_iq = butter_sos_lowpass(args.iq_lp_hz, fs, order=4)
     zf = signal.sosfiltfilt(sos_iq, z)
 
+    # --- Estimate average carrier frequency f0 using an FFT peak (robust, positive) ---
+    try:
+        N = len(zf)
+        if N < 16:
+            raise RuntimeError("Too few samples for FFT-based f0 estimation")
+        # Window the data to reduce spectral leakage
+        win = np.hanning(N)
+        Z = np.fft.fft(zf * win)
+        freqs = np.fft.fftfreq(N, d=1.0 / fs)
+        # consider only positive frequencies
+        pos = freqs > 0
+        fpos = freqs[pos]
+        mag = np.abs(Z[pos])
+
+        # Limit search to a band around the nominal args.f0 (avoid DC and very high noise)
+        low = max(0.001, args.f0 * 0.5)
+        high = max(0.1, args.f0 * 2.0)
+        band_mask = (fpos >= low) & (fpos <= high)
+        if not np.any(band_mask):
+            raise RuntimeError("No frequency bins in search band for f0 estimation")
+
+        mag_band = mag[band_mask]
+        f_band = fpos[band_mask]
+
+        # Prefer the peak closest to the nominal args.f0 to avoid picking harmonics
+        idx_closest = int(np.argmin(np.abs(f_band - args.f0)))
+
+        # Quadratic interpolation around the closest bin (if possible)
+        if 0 < idx_closest < (len(mag_band) - 1):
+            alpha = mag_band[idx_closest - 1]
+            beta = mag_band[idx_closest]
+            gamma = mag_band[idx_closest + 1]
+            denom = (alpha - 2 * beta + gamma)
+            if denom == 0:
+                delta = 0.0
+            else:
+                delta = 0.5 * (alpha - gamma) / denom
+            df = f_band[1] - f_band[0]
+            f0_est = f_band[idx_closest] + delta * df
+        else:
+            f0_est = f_band[idx_closest]
+
+        # If the chosen closest peak is suspiciously far from args.f0, warn and optionally
+        # fall back to the strongest peak in the band. Here we simply warn.
+        if abs(f0_est - args.f0) > 0.5 * args.f0:
+            # find the strongest band peak as fallback
+            peak_idx = int(np.argmax(mag_band))
+            f_peak = f_band[peak_idx]
+            print(f"Warning: closest peak {f0_est:.6f} Hz far from nominal {args.f0:.6f} Hz; strongest band peak at {f_peak:.6f} Hz")
+
+        if f0_est <= 0:
+            raise RuntimeError(f"Non-positive f0_est={f0_est}")
+
+        print(f"Estimated f0 from FFT peak: {f0_est:.8f} Hz")
+        f0 = float(f0_est)
+    except Exception as e:
+        print(f"f0 estimation failed, using --f0={args.f0}: {e}")
+        f0 = float(args.f0)
+
     # --- 3) omega(t) without unwrapping, with gating near origin ---
     omega = robust_omega_from_complex(zf, fs, eps_scale=1e-3)
 
@@ -153,7 +241,7 @@ def main():
     # --- 5) Complex demodulation at f0 to get slow envelope of v(t) ---
     # v(t) ~ Re{ V(t) * exp(+j*2π f0 t) }
     # so V(t) ~ 2 * LPF( v(t) * exp(-j*2π f0 t) )
-    carrier = np.exp(-1j * 2.0 * np.pi * args.f0 * t)
+    carrier = np.exp(-1j * 2.0 * np.pi * f0 * t)
     vbb = v_mm_s * carrier
 
     sos_env = butter_sos_lowpass(args.env_lp_hz, fs, order=4)
@@ -161,7 +249,7 @@ def main():
 
     # amplitude of velocity & convert to displacement amplitude
     Vamp = np.abs(V)                      # mm/s
-    w0 = 2.0 * np.pi * args.f0
+    w0 = 2.0 * np.pi * f0
     A_est_mm = Vamp / w0                  # mm
 
     # instantaneous frequency deviation from envelope phase:
@@ -169,32 +257,45 @@ def main():
     phi = np.unwrap(np.angle(V))
     dphi_dt = np.gradient(phi, 1.0 / fs)
     df_hz = dphi_dt / (2.0 * np.pi)
-    f_inst = args.f0 + df_hz
+    # instantaneous frequency is nominal f0 (estimated above) plus deviation
+    f_inst = f0 + df_hz
 
     # deviations relative to nominal
     dA_pct = 100.0 * (A_est_mm - args.A0) / args.A0
-    df_mHz = 1000.0 * (f_inst - args.f0)
+    df_mHz = 1000.0 * (f_inst - f0)
 
     # Optional: fit an exponential decay to A_est_mm to estimate a time constant tau
     # --- Fit amplitude decay and compute Q ---
     fit_tmin = 30.0      # or expose as --fit_tmin
     fit_tmax = None      # or expose as --fit_tmax
 
-    m, b, tau, mask, good = robust_ln_fit(t, A_est_mm, tmin=fit_tmin, tmax=fit_tmax, mad_k=4.0)
+    m, b, tau, mask_fit, good_fit = robust_ln_fit(t, A_est_mm, tmin=fit_tmin, tmax=fit_tmax, mad_k=4.0)
 
-    f0 = args.f0
+    # f0 is set to estimated value above (or fallback to args.f0)
     Q_val = np.pi * f0 * tau
 
     print(f"Decay fit window: t >= {fit_tmin:.1f} s" + ("" if fit_tmax is None else f", t <= {fit_tmax:.1f} s"))
     print(f"Fit slope m = {m:.6e} 1/s  =>  tau = {tau:.1f} s")
-    print(f"Q = pi * f0 * tau = {Q_val:.0f}   (f0={f0:.5f} Hz)")
+    print(f"Q = pi * f0 * tau = {Q_val:.0f}   (f0={f0:.7f} Hz)",end="")
+    print(f" (A = {A_est_mm[mask_fit][good_fit].max():.4f} -> {A_est_mm[mask_fit][good_fit].min():.4f} mm)")
 
 
 
     # --- Plots ---
+    # --- Frequency deviation plot with linear trend line ---
     plt.figure()
-    plt.plot(t, df_mHz, linewidth=1.0)
-    plt.title(f"Frequency deviation vs nominal f0={args.f0:.5f} Hz")
+    plt.plot(t, df_mHz, linewidth=1.0, label='Δf (mHz)')
+    # linear trend fit (ignore NaNs)
+    good = np.isfinite(df_mHz)
+    if good.sum() >= 2:
+        slope, intercept = np.polyfit(t[good], df_mHz[good], 1)
+        trend = slope * t + intercept
+        plt.plot(t, trend, '--', color='red', linewidth=1.2, label=f'Linear trend: {slope:.3e} mHz/s')
+        total_drift_mHz = slope * (t[-1] - t[0])
+        plt.annotate(f'Trend {slope:.3e} mHz/s\nTotal Δ {total_drift_mHz:.2e} mHz', xy=(0.02, 0.95), xycoords='axes fraction', color='red', fontsize=9, verticalalignment='top')
+
+    plt.title(f"Frequency deviation vs nominal f0={f0:.8f} Hz")
+    plt.legend()
     plt.xlabel("Time (s)")
     plt.ylabel("Δf (mHz)")
     plt.ylim(-np.nanmax(np.abs(df_mHz))*1.1, np.nanmax(np.abs(df_mHz))*1.1)  # symmetric
@@ -224,7 +325,7 @@ def main():
 
 
     # Plot amplitude and fitted exponential
-    tt = t[mask][good]
+    tt = t[mask_fit][good_fit]
     A_fit = np.exp(b + m * tt)
 
     plt.figure()
@@ -239,7 +340,7 @@ def main():
 
     # Optional: plot ln(A) with fit line (useful diagnostic)
     plt.figure()
-    plt.plot(t[mask], np.log(A_est_mm[mask]), ".", markersize=2, label="ln(A) used (pre-outlier)")
+    plt.plot(t[mask_fit], np.log(A_est_mm[mask_fit]), ".", markersize=2, label="ln(A) used (pre-outlier)")
     plt.plot(tt, b + m * tt, linewidth=2.0, label="linear fit in ln(A)")
     plt.axvline(fit_tmin, linestyle="--", linewidth=1.0)
     plt.title("ln(Amplitude) linearized decay fit")
@@ -247,7 +348,7 @@ def main():
     plt.ylabel("ln(A)")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    
+
     plt.show()
 
 
